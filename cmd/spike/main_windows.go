@@ -327,7 +327,7 @@ func (s *spike) openClassify(p string, in hid.Info) *dev {
 	log.Info("opened", "pid", fmt.Sprintf("0x%04X", in.ProductID),
 		"changeHostIdx", hostFI, "changeHostErr", herr, "reprogIdx", reprog, "reprogErr", rerr)
 	d := &dev{info: in, conn: conn, role: roleOther, hostFI: hostFI, reprog: reprog, hasHost: herr == nil}
-	if herr != nil && rerr != nil && !isNoFeature(herr) && !isNoFeature(rerr) {
+	if (herr != nil && !isNoFeature(herr)) || (rerr != nil && !isNoFeature(rerr)) {
 		log.Error("feature lookup failed; closing", "herr", herr, "rerr", rerr)
 		conn.Close()
 		return nil
@@ -415,7 +415,7 @@ func (s *spike) pump(p string, d *dev) {
 }
 
 func (s *spike) switchTo(k int, kbPath string) {
-	s.log.Info("press", "slot", k)
+	s.log.Info("press", "slot", k+1)
 	s.mu.Lock()
 	var mice, kbs []*dev
 	for _, d := range s.devs {
@@ -429,13 +429,13 @@ func (s *spike) switchTo(k int, kbPath string) {
 	s.mu.Unlock()
 	for _, m := range mice {
 		err := m.conn.SetHost(m.hostFI, k, 200*time.Millisecond)
-		s.log.Info("mouse SetHost", "path", m.info.Path, "slot", k, "err", err)
+		s.log.Info("mouse SetHost", "path", m.info.Path, "slot", k+1, "err", err)
 	}
 	for _, kb := range kbs {
 		if kb.info.Path != kbPath {
 			continue
 		}
 		err := kb.conn.SetHost(kb.hostFI, k, hidpp.DefaultTimeout)
-		s.log.Info("keyboard SetHost", "path", kb.info.Path, "slot", k, "err", err)
+		s.log.Info("keyboard SetHost", "path", kb.info.Path, "slot", k+1, "err", err)
 	}
 }
