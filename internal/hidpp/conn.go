@@ -199,10 +199,21 @@ func (c *Conn) clearPending(p *pending) {
 	c.mu.Unlock()
 }
 
-// Send is Request that discards the reply.
+// Send writes a function call without waiting for a reply. timeout is the
+// write timeout. It is serialised with Request.
 func (c *Conn) Send(feat, fn byte, params []byte, timeout time.Duration) error {
-	_, err := c.Request(feat, fn, params, timeout)
-	return err
+	c.reqMu.Lock()
+	defer c.reqMu.Unlock()
+
+	c.mu.Lock()
+	err := c.err
+	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	m := Message{Dev: c.index, Feature: feat, Function: fn, SWID: requestSWID}
+	copy(m.Params[:], params)
+	return c.dev.Write(Encode(m), timeout)
 }
 
 // Close stops the reader and closes the device.

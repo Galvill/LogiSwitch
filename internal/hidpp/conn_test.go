@@ -116,7 +116,8 @@ func TestRequestDeviceErrorHidpp1(t *testing.T) {
 	c := NewConn(d, 1)
 	defer c.Close()
 	_, err := c.Request(0x05, 2, nil, time.Second)
-	if de, ok := err.(DeviceError); !ok || de.Code != 0x02 {
+	var de DeviceError
+	if !errors.As(err, &de) || de.Code != 0x02 {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -152,10 +153,18 @@ func TestReadErrorFailsRequests(t *testing.T) {
 
 func TestSendAndClose(t *testing.T) {
 	d := &stubDevice{}
-	d.onWrite = func(req []byte) [][]byte { return [][]byte{reply(req)} }
+	var written [][]byte
+	d.onWrite = func(req []byte) [][]byte { written = append(written, req); return nil }
 	c := NewConn(d, 1)
-	if err := c.Send(0x05, 0, nil, time.Second); err != nil {
+	start := time.Now()
+	if err := c.Send(0x05, 0, []byte{1}, time.Second); err != nil {
 		t.Fatal(err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatal("Send blocked waiting for a reply")
+	}
+	if len(written) != 1 || written[0][2] != 0x05 || written[0][4] != 1 {
+		t.Fatalf("written = % x", written)
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)

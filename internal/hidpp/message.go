@@ -15,7 +15,7 @@ func Encode(m Message) []byte {
 	b[0] = 0x11
 	b[1] = m.Dev
 	b[2] = m.Feature
-	b[3] = m.Function<<4 | m.SWID&0x0F
+	b[3] = (m.Function&0x0F)<<4 | m.SWID&0x0F
 	copy(b[4:], m.Params[:])
 	return b
 }
