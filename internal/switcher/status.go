@@ -60,7 +60,10 @@ func (s *Switcher) SetAll(slot int) error {
 		}
 	}
 	slices.SortFunc(kbs, func(a, b *device) int { return strings.Compare(a.path, b.path) })
-	s.startSwitch(kbs, k, s.cfg.MouseSlotFor[k])
+	sent := s.startSwitch(kbs, k, s.cfg.MouseSlotFor[k])
 	s.Settle()
+	if len(kbs) > 0 && sent == 0 {
+		return errors.New("keyboard setHost failed")
+	}
 	return nil
 }

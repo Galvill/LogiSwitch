@@ -483,17 +483,94 @@ func TestPendingClearedWhenKeyboardReturns(t *testing.T) {
 	}
 }
 
+// stayKB makes the keyboard accept setHost without leaving (the write is
+// swallowed), so it stays registered and connected.
+func (r *rig) stayKB() { r.o.setSwallow(kbPath, kbCH, 1, true) }
+
 func TestNoDivertCheckAfterKeyboardLeaves(t *testing.T) {
 	r := newRig(t, config.Default(), 0, 0, true)
-	kd := r.s.devs[kbPath]
-	r.inject(0xD2) // switches the keyboard; it is still registered until its conn closes
-	if !kd.leaving {
+	r.stayKB()
+	r.inject(0xD2)
+	if r.s.devs[kbPath].leavingSince.IsZero() {
 		t.Fatal("keyboard not marked leaving after its host changed")
 	}
 	before := r.o.callCount(kbPath, kbRP, 2)
-	r.s.Tick()
-	r.s.Settle()
+	r.clk.Advance(time.Second)
+	r.tick()
 	if after := r.o.callCount(kbPath, kbRP, 2); after != before {
-		t.Errorf("getCidReporting calls %d -> %d, want none after the keyboard left", before, after)
+		t.Errorf("getCidReporting calls %d -> %d, want none while the keyboard is leaving", before, after)
+	}
+}
+
+func TestLeavingKeyboardThatStaysResumesUpkeep(t *testing.T) {
+	r := newRig(t, config.Default(), 0, 0, true)
+	r.stayKB()
+	r.inject(0xD2)
+	kd := r.s.devs[kbPath]
+	if kd.host != 1 {
+		t.Fatalf("host = %d, want 1 after switch", kd.host)
+	}
+	before := r.o.callCount(kbPath, kbRP, 2)
+	r.clk.Advance(6 * time.Second)
+	r.tick()
+	if after := r.o.callCount(kbPath, kbRP, 2); after != before+1 {
+		t.Errorf("getCidReporting calls %d -> %d, want one re-check after 5s", before, after)
+	}
+	if kd.host != 0 || !kd.leavingSince.IsZero() {
+		t.Errorf("host = %d leavingSince = %v, want host refreshed to 0 and flag cleared", kd.host, kd.leavingSince)
+	}
+	// Own slot is now slot 1 again, so pressing it is ignored; slot 2 switches.
+	r.inject(0xD2)
+	if got := r.kb.SetHostCalls(); len(got) != 0 {
+		t.Logf("fake saw %v (swallowed writes are not delivered)", got)
+	}
+	if r.o.callCount(kbPath, kbCH, 1) != 2 {
+		t.Errorf("second press to slot 2 not sent")
+	}
+}
+
+func TestPendingKeptWhenOtherKeyboardCommits(t *testing.T) {
+	r := newRig(t, config.Default(), 0, 0, false)
+	r.press(0xD2)
+	r.tick()
+	if r.s.pend == nil {
+		t.Fatal("no pending")
+	}
+	other := hidpptest.NewKeyboard(0)
+	r.o.add(hidppInfo(`\\?\hid#kb2`, "MX_Keys"), other)
+	r.tick()
+	if r.s.devs[`\\?\hid#kb2`] == nil {
+		t.Fatal("second keyboard not opened")
+	}
+	if r.s.pend == nil {
+		t.Error("pending cancelled by a different keyboard")
+	}
+}
+
+func TestPendingReplacedWithoutKeyboardCommit(t *testing.T) {
+	r := newRig(t, config.Default(), 0, 0, false) // mouse asleep
+	r.stayKB()
+	if err := r.s.SetAll(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.s.SetAll(3); err != nil {
+		t.Fatal(err)
+	}
+	if p := r.s.pend; p == nil || p.slot != 2 {
+		t.Fatalf("pending = %+v, want slot 2 (wire)", p)
+	}
+	r.o.setPresent(mousePath, true)
+	r.clk.Advance(time.Second)
+	r.tick()
+	if got := r.mouse.SetHostCalls(); !eq(got, 2) {
+		t.Errorf("mouse setHost = %v, want [2] only", got)
+	}
+}
+
+func TestSetAllErrorsWhenKeyboardWriteFails(t *testing.T) {
+	r := newRig(t, config.Default(), 0, 0, false)
+	r.kb.Disconnect()
+	if err := r.s.SetAll(2); err == nil {
+		t.Error("SetAll = nil, want error when the keyboard setHost failed")
 	}
 }

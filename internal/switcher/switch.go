@@ -23,6 +23,9 @@ const (
 	// deliveryWindow: a mouse whose conn closes within this long after a
 	// successful setHost write is taken to have switched.
 	deliveryWindow = 2 * time.Second
+	// leavingGrace: how long a keyboard we switched may stay registered
+	// before we assume it did not leave and resume upkeep on it.
+	leavingGrace = 5 * time.Second
 )
 
 // pendingSwitch is a mouse switch not yet known to be delivered. It survives
@@ -31,6 +34,10 @@ type pendingSwitch struct {
 	gen     int // distinguishes results of a replaced switch
 	slot    int // mouse target, 0-based
 	expires time.Time
+	// kbPaths are the keyboards this switch moved away. Re-committing one of
+	// them cancels the switch (ruling 9); if none was moved, any keyboard
+	// commit cancels it.
+	kbPaths map[string]bool
 	busy    map[*device]bool      // mouse has a write or probe in flight
 	sent    map[*device]time.Time // mouse took a setHost write at this time
 }
@@ -81,12 +88,18 @@ func (s *Switcher) onKeyboardEvent(kb *device, m hidpp.Message) {
 // earlier one), starts setHost writes to every registered mouse on workers,
 // then sends setHost(kbSlot) to each of kbs without waiting for the mice.
 // Slots are 0-based. Owner goroutine only.
-func (s *Switcher) startSwitch(kbs []*device, kbSlot, mouseSlot int) {
+// It returns how many keyboard setHost writes succeeded.
+func (s *Switcher) startSwitch(kbs []*device, kbSlot, mouseSlot int) (sent int) {
 	now := s.clk.Now()
 	s.gen++
 	s.pend = &pendingSwitch{
 		gen: s.gen, slot: mouseSlot, expires: now.Add(pendingTTL),
 		busy: map[*device]bool{}, sent: map[*device]time.Time{},
+		kbPaths: map[string]bool{},
+	}
+	p := s.pend
+	for _, kb := range kbs {
+		p.kbPaths[kb.path] = true
 	}
 	s.upkeepPending(now)
 	for _, kb := range kbs {
@@ -95,8 +108,26 @@ func (s *Switcher) startSwitch(kbs []*device, kbSlot, mouseSlot int) {
 			continue
 		}
 		kb.host = kbSlot // it is leaving for kbSlot
-		kb.leaving = true
+		kb.leavingSince = now
+		sent++
 	}
+	return sent
+}
+
+// keyboardLeaving reports whether kb is within leavingGrace of a host change,
+// so its divert check is skipped. When the grace ends with kb still here
+// (the write did not make it leave), the flag is cleared and its host
+// forgotten so the normal check re-reads it.
+func (s *Switcher) keyboardLeaving(kb *device, now time.Time) bool {
+	if kb.leavingSince.IsZero() {
+		return false
+	}
+	if now.Sub(kb.leavingSince) < leavingGrace {
+		return true
+	}
+	kb.leavingSince = time.Time{}
+	kb.host = -1
+	return false
 }
 
 // upkeepPending expires the pending switch or moves it along on each
