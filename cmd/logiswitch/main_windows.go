@@ -35,7 +35,8 @@ const usageText = `usage: logiswitch <command>
   run         run in this console, logging to stdout (Ctrl+C to stop)
   list        show detected devices, feature indexes, current host, and
               whether the keys were already diverted (by another program)
-  set N       send the mouse and keyboard to slot N (1-3)`
+  set N       send the mouse and keyboard to slot N (1-3)
+  version     print the version`
 
 func main() {
 	if isSvc, err := svc.IsWindowsService(); err == nil && isSvc {
@@ -81,6 +82,9 @@ func dispatch(args []string) int {
 		return exitFor(cmdRun())
 	case "list":
 		return exitFor(cmdList())
+	case "version":
+		fmt.Println("logiswitch", version)
+		return 0
 	}
 	return usage()
 }

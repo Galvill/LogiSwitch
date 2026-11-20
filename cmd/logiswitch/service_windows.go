@@ -79,7 +79,7 @@ func (h *handler) Execute(_ []string, req <-chan svc.ChangeRequest, st chan<- sv
 	// Startup hibernates session 0), send no Stop or Shutdown, yet must
 	// give the keys back.
 	st <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent}
-	log.Info("service started")
+	log.Info("service started", "version", version)
 	h.ev.info("LogiSwitch started")
 
 loop:
