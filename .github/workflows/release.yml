@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: GOOS=windows GOARCH=amd64 go vet ./...
+      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/logiswitch
+
+  release-please:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@v4
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build logiswitch.exe
+        run: |
+          mkdir -p dist/pkg
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.version=${TAG}" \
+            -o dist/pkg/logiswitch.exe ./cmd/logiswitch
+          cp README.md LICENSE dist/pkg/
+          cd dist/pkg
+          zip -q "../logiswitch-${TAG}-windows-amd64.zip" logiswitch.exe README.md LICENSE
+          cd ..
+          sha256sum "logiswitch-${TAG}-windows-amd64.zip" > "logiswitch-${TAG}-windows-amd64.zip.sha256"
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" \
+            "dist/logiswitch-${TAG}-windows-amd64.zip" \
+            "dist/logiswitch-${TAG}-windows-amd64.zip.sha256" \
+            --clobber
