@@ -33,7 +33,8 @@ const usageText = `usage: logiswitch <command>
   start       start the service; admin
   stop        stop the service; admin
   run         run in this console, logging to stdout (Ctrl+C to stop)
-  list        show detected devices, feature indexes, current host, divert state
+  list        show detected devices, feature indexes, current host, and
+              whether the keys were already diverted (by another program)
   set N       send the mouse and keyboard to slot N (1-3)`
 
 func main() {
@@ -149,7 +150,10 @@ func cmdList() error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "KIND\tHOST\tDIVERTED\tCHANGE_HOST\tREPROG\tPRODUCT\tPATH")
+	// WAS_DIVERTED is the state found before list diverted the keys itself:
+	// true means something else (Logi Options+, a crashed LogiSwitch) holds
+	// them.
+	fmt.Fprintln(tw, "KIND\tHOST\tWAS_DIVERTED\tCHANGE_HOST\tREPROG\tPRODUCT\tPATH")
 	for _, d := range st {
 		host := "?"
 		if d.CurrentHost > 0 {
@@ -157,7 +161,7 @@ func cmdList() error {
 		}
 		div := "-"
 		if d.Kind == "keyboard" {
-			div = strconv.FormatBool(d.Diverted)
+			div = strconv.FormatBool(d.DivertedBefore)
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t0x%02X\t0x%02X\t%s\t%s\n",
 			d.Kind, host, div, d.ChangeHostIdx, d.ReprogIdx, d.Product, d.Path)

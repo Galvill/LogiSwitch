@@ -12,6 +12,10 @@ type DeviceStatus struct {
 	ChangeHostIdx, ReprogIdx byte
 	CurrentHost              int  // 1-based; 0 if unknown
 	Diverted                 bool // keyboards: D1-D3 currently diverted; mice: false
+	// DivertedBefore: keyboards: D1 was already diverted when this
+	// Switcher opened the keyboard, i.e. before it diverted the keys itself
+	// (Logi Options+ or another, possibly crashed, LogiSwitch holds them).
+	DivertedBefore bool
 }
 
 // Status reports every registered device, sorted by Kind then Path. Owner
@@ -22,8 +26,9 @@ func (s *Switcher) Status() []DeviceStatus {
 		out = append(out, DeviceStatus{
 			Product: d.product, Path: d.path, Kind: d.role.String(),
 			ChangeHostIdx: d.chIdx, ReprogIdx: d.rpIdx,
-			CurrentHost: d.host + 1, // -1 (unknown) becomes 0
-			Diverted:    d.role == roleKeyboard && d.diverted,
+			CurrentHost:    d.host + 1, // -1 (unknown) becomes 0
+			Diverted:       d.role == roleKeyboard && d.diverted,
+			DivertedBefore: d.role == roleKeyboard && d.divertedBefore,
 		})
 	}
 	slices.SortFunc(out, func(a, b DeviceStatus) int {

@@ -31,6 +31,11 @@ const (
 	eventDedup = 10 * time.Minute
 	// stopGiveUp bounds the wait for Release on Stop/Shutdown.
 	stopGiveUp = 30 * time.Second
+
+	// Power broadcast event types (EventType of an svc.PowerEvent).
+	pbtAPMSuspend         = 0x4  // PBT_APMSUSPEND: sleep, hibernate, Fast Startup shutdown
+	pbtAPMResumeSuspend   = 0x7  // PBT_APMRESUMESUSPEND: resumed, user present
+	pbtAPMResumeAutomatic = 0x12 // PBT_APMRESUMEAUTOMATIC: resumed
 )
 
 func runService() {
@@ -55,9 +60,9 @@ func (h *handler) Execute(_ []string, req <-chan svc.ChangeRequest, st chan<- sv
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	sw := switcher.New(hid.System, cfg, sysClock{}, log)
 	go func() {
 		defer close(done)
-		sw := switcher.New(hid.System, cfg, sysClock{}, log)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("panic; releasing keys and exiting", "panic", r)
@@ -70,7 +75,10 @@ func (h *handler) Execute(_ []string, req <-chan svc.ChangeRequest, st chan<- sv
 		}()
 		sw.Run(ctx)
 	}()
-	st <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+	// Power events too: sleep, and the default Windows shutdown (Fast
+	// Startup hibernates session 0), send no Stop or Shutdown, yet must
+	// give the keys back.
+	st <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent}
 	log.Info("service started")
 	h.ev.info("LogiSwitch started")
 
@@ -82,6 +90,17 @@ loop:
 		case svc.Stop, svc.Shutdown:
 			log.Info("service stop requested", "cmd", c.Cmd)
 			break loop
+		case svc.PowerEvent:
+			switch c.EventType {
+			case pbtAPMSuspend:
+				log.Info("power: suspending")
+				if !sw.Suspend() {
+					log.Warn("power: release before suspend did not finish in time")
+				}
+			case pbtAPMResumeAutomatic, pbtAPMResumeSuspend:
+				log.Info("power: resumed", "event", c.EventType)
+				sw.Resume()
+			}
 		}
 	}
 

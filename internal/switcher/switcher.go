@@ -129,6 +129,10 @@ type Switcher struct {
 	quit     chan struct{}
 	wg       sync.WaitGroup // readers and workers
 	released bool
+
+	suspendReq chan chan struct{} // Suspend -> Run; closed when done
+	resumeReq  chan struct{}      // Resume -> Run (buffered 1)
+	heldUntil  time.Time          // upkeep paused after a suspend until then
 }
 
 // New returns a Switcher; it does nothing until Tick or Run.
@@ -149,11 +153,14 @@ func New(o hid.Opener, cfg config.Config, clk Clock, log *slog.Logger) *Switcher
 		gone:    make(chan *device, 16),
 		results: make(chan any, 16),
 		quit:    make(chan struct{}),
+
+		suspendReq: make(chan chan struct{}),
+		resumeReq:  make(chan struct{}, 1),
 	}
 }
 
-// Run ticks every PollInterval and handles device events and worker results
-// until ctx is done, then calls Release.
+// Run ticks every PollInterval and handles device events, worker results and
+// Suspend/Resume requests until ctx is done, then calls Release.
 func (s *Switcher) Run(ctx context.Context) {
 	t := time.NewTicker(s.cfg.PollInterval)
 	defer t.Stop()
@@ -171,6 +178,11 @@ func (s *Switcher) Run(ctx context.Context) {
 			s.handleResult(r)
 		case <-t.C:
 			s.Tick()
+		case done := <-s.suspendReq:
+			s.suspend()
+			close(done)
+		case <-s.resumeReq:
+			s.resume()
 		}
 	}
 }
@@ -178,12 +190,16 @@ func (s *Switcher) Run(ctx context.Context) {
 // Tick drains queued events and results, then does one upkeep pass: close
 // devices that vanished, re-check diversion on open keyboards, start opening
 // new paths, and push any pending mouse switch along. It does not wait for
-// the workers it starts (see Settle). After Release it does nothing.
+// the workers it starts (see Settle). After Release, and while paused after
+// a suspend, it only drains (or does nothing at all).
 func (s *Switcher) Tick() {
 	if s.released {
 		return
 	}
 	s.drain()
+	if s.held() {
+		return
+	}
 	s.logPresence()
 	infos, err := s.opener.Enumerate(logitechVID)
 	if err != nil {
@@ -247,85 +263,6 @@ func (s *Switcher) Settle() {
 			return
 		}
 		s.handleResult(<-s.results)
-	}
-}
-
-// Release undiverts D1-D3 on open keyboards and closes every device. It
-// first waits for in-flight workers so that a keyboard still being opened is
-// released too. It must be called on the owner goroutine (Run does so
-// itself); it is safe to call more than once, and Tick and Settle do nothing
-// afterwards.
-func (s *Switcher) Release() {
-	if s.released {
-		return
-	}
-	s.released = true
-	for s.inflight > 0 {
-		s.handleResult(<-s.results)
-	}
-	paths := make([]string, 0, len(s.devs))
-	for p := range s.devs {
-		paths = append(paths, p)
-	}
-	slices.Sort(paths)
-	for _, p := range paths {
-		d := s.devs[p]
-		if d.role != roleKeyboard {
-			continue
-		}
-		if err := undivert(d); err != nil {
-			// Expected when the keyboard has already gone.
-			s.log.Info("undivert failed", "path", p, "err", err)
-		} else {
-			s.log.Info("keys released", "path", p)
-		}
-	}
-	close(s.quit)
-	for _, d := range s.devs {
-		d.conn.Close()
-	}
-	s.devs = map[string]*device{}
-	s.pend = nil
-	s.wg.Wait()
-}
-
-// undivert returns D1-D3 to the keyboard firmware. It stops at the first
-// failed write: a keyboard that has gone would fail the rest too, each
-// after a full timeout.
-func undivert(d *device) error {
-	for _, cid := range hidpp.HostSwitchCIDs {
-		if err := d.conn.SetDiverted(d.rpIdx, cid, false); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// logPresence logs "no keyboard found" / "keyboard found" (and the same for
-// the mouse) when whether one is registered changes, and once when
-// discovery first settles. It waits while opens are in flight, so a device
-// still being classified is not reported missing.
-func (s *Switcher) logPresence() {
-	if !s.enumerated || len(s.opening) > 0 {
-		return
-	}
-	for _, r := range []role{roleKeyboard, roleMouse} {
-		have := false
-		for _, d := range s.devs {
-			if d.role == r {
-				have = true
-				break
-			}
-		}
-		if was, ok := s.seen[r]; ok && was == have {
-			continue
-		}
-		s.seen[r] = have
-		if have {
-			s.log.Info(r.String() + " found")
-		} else {
-			s.log.Info("no " + r.String() + " found")
-		}
 	}
 }
 
