@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,7 +44,9 @@ func TestAppendsAcrossOpen(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		w.Write([]byte(s))
+		if _, err := w.Write([]byte(s)); err != nil {
+			t.Fatal(err)
+		}
 		w.Close()
 	}
 	b, _ := os.ReadFile(path)
@@ -54,8 +57,14 @@ func TestAppendsAcrossOpen(t *testing.T) {
 
 func TestOversizedSingleWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.log")
-	w, _ := OpenRotating(path, 5)
+	w, err := OpenRotating(path, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer w.Close()
+	if _, err := w.Write([]byte("hi\n")); err != nil {
+		t.Fatal(err)
+	}
 	big := strings.Repeat("z", 50)
 	if _, err := w.Write([]byte(big)); err != nil {
 		t.Fatal(err)
@@ -64,11 +73,29 @@ func TestOversizedSingleWrite(t *testing.T) {
 	if string(b) != big {
 		t.Fatalf("got %q", b)
 	}
+	o, _ := os.ReadFile(path + ".1")
+	if string(o) != "hi\n" {
+		t.Fatalf("old %q", o)
+	}
+}
+
+func TestWriteAfterClose(t *testing.T) {
+	w, err := OpenRotating(filepath.Join(t.TempDir(), "x.log"), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if _, err := w.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("got %v", err)
+	}
 }
 
 func TestConcurrentWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.log")
-	w, _ := OpenRotating(path, 100)
+	w, err := OpenRotating(path, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer w.Close()
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -76,7 +103,9 @@ func TestConcurrentWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				w.Write([]byte("line of text\n"))
+				if _, err := w.Write([]byte("line of text\n")); err != nil {
+					t.Error(err)
+				}
 			}
 		}()
 	}

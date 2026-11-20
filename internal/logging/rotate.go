@@ -18,11 +18,12 @@ func DefaultPath() string {
 }
 
 type rotator struct {
-	mu   sync.Mutex
-	path string
-	max  int64
-	f    *os.File
-	size int64
+	mu     sync.Mutex
+	path   string
+	max    int64
+	f      *os.File
+	size   int64
+	closed bool
 }
 
 // OpenRotating opens (appending) a log file that is rotated to path+".1"
@@ -53,9 +54,9 @@ func (r *rotator) open() error {
 }
 
 func (r *rotator) rotate() error {
-	if err := r.f.Close(); err != nil {
-		return err
-	}
+	// Drop the handle regardless of Close's result so a failed Close
+	// cannot leave a dead writer behind.
+	_ = r.f.Close()
 	r.f = nil
 	old := r.path + ".1"
 	if err := os.Rename(r.path, old); err != nil {
@@ -74,6 +75,9 @@ func (r *rotator) rotate() error {
 func (r *rotator) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return 0, os.ErrClosed
+	}
 	if r.f == nil {
 		if err := r.open(); err != nil {
 			return 0, err
@@ -92,6 +96,10 @@ func (r *rotator) Write(p []byte) (int, error) {
 func (r *rotator) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
 	if r.f == nil {
 		return nil
 	}
