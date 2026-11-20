@@ -9,9 +9,10 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strconv"
 	"time"
+
+	"logiswitch/internal/paths"
 )
 
 // Config holds runtime settings.
@@ -30,14 +31,8 @@ func Default() Config {
 	}
 }
 
-// DefaultPath returns %ProgramData%\LogiSwitch\config.json.
-func DefaultPath() string {
-	pd := os.Getenv("ProgramData")
-	if pd == "" {
-		pd = `C:\ProgramData`
-	}
-	return filepath.Join(pd, "LogiSwitch", "config.json")
-}
+// DefaultPath returns <ProgramData>\LogiSwitch\config.json.
+func DefaultPath() string { return paths.ConfigPath() }
 
 type fileFormat struct {
 	MouseSlotForKeyboardSlot map[string]int `json:"mouseSlotForKeyboardSlot"`
@@ -47,14 +42,19 @@ type fileFormat struct {
 
 // Load reads path. A missing file yields Default().
 func Load(path string) (Config, error) {
-	c := Default()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return c, nil
+			return Default(), nil
 		}
-		return c, fmt.Errorf("config: %w", err)
+		return Default(), fmt.Errorf("config: %w", err)
 	}
+	return Parse(data)
+}
+
+// Parse decodes config file contents. On error it returns Default().
+func Parse(data []byte) (Config, error) {
+	c := Default()
 	var f fileFormat
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()

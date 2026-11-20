@@ -257,7 +257,7 @@ func TestDataDir(t *testing.T) {
 
 func TestSecureDataDirCreates(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "a", "LogiSwitch")
-	if err := SecureDataDir(dir); err != nil {
+	if _, err := SecureDataDir(dir); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(dir)

@@ -7,19 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"logiswitch/internal/paths"
 )
 
-// DataDir returns %ProgramData%\LogiSwitch (fallback C:\ProgramData\LogiSwitch).
-func DataDir() string {
-	pd := os.Getenv("ProgramData")
-	if pd == "" {
-		pd = `C:\ProgramData`
-	}
-	return filepath.Join(pd, "LogiSwitch")
-}
+// DataDir returns <ProgramData>\LogiSwitch (see package paths).
+func DataDir() string { return paths.DataDir() }
 
-// DefaultPath returns %ProgramData%\LogiSwitch\logiswitch.log.
-func DefaultPath() string { return filepath.Join(DataDir(), "logiswitch.log") }
+// DefaultPath returns <ProgramData>\LogiSwitch\logiswitch.log.
+func DefaultPath() string { return paths.LogPath() }
 
 type rotator struct {
 	mu     sync.Mutex
@@ -75,7 +71,7 @@ func (r *rotator) rotate() error {
 	_ = CheckFile(old)
 	err := os.Rename(r.path, old)
 	if err != nil {
-		_ = os.Remove(old)
+		_ = removeName(old)
 		err = os.Rename(r.path, old)
 	}
 	if err != nil {

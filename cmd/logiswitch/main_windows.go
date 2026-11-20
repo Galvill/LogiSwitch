@@ -89,9 +89,12 @@ func exitFor(err error) int {
 	if err == nil {
 		return 0
 	}
-	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+	switch {
+	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
 		fmt.Fprintln(os.Stderr, "error: access denied: run as administrator")
-	} else {
+	case errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE):
+		fmt.Fprintln(os.Stderr, "error: the LogiSwitch service is marked for deletion (close Services/Event Viewer windows); wait or reboot, then retry")
+	default:
 		fmt.Fprintln(os.Stderr, "error:", err)
 	}
 	return 1
@@ -169,10 +172,18 @@ func cmdSet(slot int) error {
 	}
 	sw := switcher.New(hid.System, cfg, sysClock{}, log)
 	err = sw.SetAll(slot)
+	mouse := false
+	for _, d := range sw.Status() {
+		mouse = mouse || d.Kind == "mouse"
+	}
 	sw.Release()
 	if err != nil {
 		return fmt.Errorf("set %d: %w", slot, err)
 	}
-	fmt.Printf("switched to slot %d (mouse to slot %d)\n", slot, cfg.MouseSlotFor[slot-1]+1)
+	if mouse {
+		fmt.Printf("switched to slot %d (mouse to slot %d)\n", slot, cfg.MouseSlotFor[slot-1]+1)
+	} else {
+		fmt.Printf("switched to slot %d (no mouse found)\n", slot)
+	}
 	return nil
 }

@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
 
@@ -27,6 +29,8 @@ const (
 	eidError = 3
 	// eventDedup suppresses repeats of an identical error in the event log.
 	eventDedup = 10 * time.Minute
+	// stopGiveUp bounds the wait for Release on Stop/Shutdown.
+	stopGiveUp = 30 * time.Second
 )
 
 func runService() {
@@ -53,7 +57,18 @@ func (h *handler) Execute(_ []string, req <-chan svc.ChangeRequest, st chan<- sv
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		switcher.New(hid.System, cfg, sysClock{}, log).Run(ctx)
+		sw := switcher.New(hid.System, cfg, sysClock{}, log)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("panic; releasing keys and exiting", "panic", r)
+				func() {
+					defer func() { _ = recover() }()
+					sw.Release()
+				}()
+				panic(r) // crash: the SCM recovery actions restart the service
+			}
+		}()
+		sw.Run(ctx)
 	}()
 	st <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	log.Info("service started")
@@ -77,6 +92,7 @@ loop:
 	cancel()
 	t := time.NewTicker(3 * time.Second)
 	defer t.Stop()
+	giveUp := time.After(stopGiveUp)
 wait:
 	for {
 		select {
@@ -85,6 +101,11 @@ wait:
 		case <-t.C:
 			checkpoint++
 			st <- svc.Status{State: svc.StopPending, CheckPoint: checkpoint, WaitHint: 10000}
+		case <-giveUp:
+			log.Error("release did not finish; stopping anyway", "after", stopGiveUp)
+			closeLog()
+			h.ev.info("LogiSwitch stopped (release timed out)")
+			return false, uint32(windows.ERROR_TIMEOUT)
 		}
 	}
 	log.Info("service stopped")
@@ -107,17 +128,21 @@ func (h *handler) setup() (*slog.Logger, config.Config, func()) {
 		},
 	})
 	dir := logging.DataDir()
-	if err := logging.SecureDataDir(dir); err != nil {
+	warnings, err := logging.SecureDataDir(dir)
+	if err != nil {
 		h.ev.error("cannot secure data directory; running with defaults, no file log, config.json ignored: " + err.Error())
 		return slog.New(evHandler), config.Default(), func() {}
 	}
 
 	var problems []string
-	cfgPath := config.DefaultPath()
 	cfg := config.Default()
-	if err := logging.CheckFile(cfgPath); err != nil {
-		problems = append(problems, "config.json ignored: "+err.Error())
-	} else if c, err := config.Load(cfgPath); err != nil {
+	// Read only through the handle-validated path: the bytes come from the
+	// handle whose type, link count and owner were checked.
+	if data, err := logging.ReadTrustedFile(config.DefaultPath()); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			problems = append(problems, "config.json ignored; using defaults: "+err.Error())
+		}
+	} else if c, err := config.Parse(data); err != nil {
 		problems = append(problems, "config load failed; using defaults: "+err.Error())
 	} else {
 		cfg = c
@@ -132,6 +157,9 @@ func (h *handler) setup() (*slog.Logger, config.Config, func()) {
 		closeLog = func() { w.Close() }
 	}
 	log := slog.New(handlers)
+	for _, w := range warnings {
+		log.Warn(w)
+	}
 	for _, p := range problems {
 		log.Error(p)
 	}

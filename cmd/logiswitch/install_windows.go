@@ -5,8 +5,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -15,6 +17,7 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 
 	"logiswitch/internal/logging"
+	"logiswitch/internal/paths"
 )
 
 const (
@@ -22,17 +25,18 @@ const (
 	displayName = "LogiSwitch (mouse follows keyboard)"
 	description = "Moves the Logitech mouse to the Easy-Switch channel chosen on the Logitech keyboard."
 	stopTimeout = 10 * time.Second
+	exeName     = "logiswitch.exe"
 )
 
 func install() error {
-	exe, err := os.Executable()
+	src, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+	if src, err = filepath.EvalSymlinks(src); err != nil {
 		return err
 	}
-	if exe, err = filepath.Abs(exe); err != nil {
+	if src, err = filepath.Abs(src); err != nil {
 		return err
 	}
 	m, err := mgr.Connect()
@@ -40,13 +44,33 @@ func install() error {
 		return err
 	}
 	defer m.Disconnect()
-	if s, err := m.OpenService(svcName); err == nil {
-		s.Close()
-		return errors.New("already installed (run: logiswitch uninstall first)")
+	existing, err := m.OpenService(svcName)
+	if err == nil {
+		defer existing.Close()
+		st, err := existing.Query()
+		if err != nil {
+			return err
+		}
+		if st.State != svc.Stopped {
+			return errors.New("the service is running: stop the service first (logiswitch stop), then run install again")
+		}
+	} else {
+		existing = nil
 	}
-	dir := logging.DataDir()
-	if err := logging.SecureDataDir(dir); err != nil {
-		return fmt.Errorf("securing %s: %w", dir, err)
+	dataDir := logging.DataDir()
+	warnings, err := logging.SecureDataDir(dataDir)
+	if err != nil {
+		return fmt.Errorf("securing %s: %w", dataDir, err)
+	}
+	for _, w := range warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+	exe, err := installExe(src)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return updateService(existing, exe, dataDir)
 	}
 	s, err := m.CreateService(svcName, exe, mgr.Config{
 		StartType:   mgr.StartAutomatic,
@@ -58,23 +82,124 @@ func install() error {
 		return err
 	}
 	defer s.Close()
-	fail := func(what string, err error) error {
+	if err := finishInstall(s); err != nil {
 		_ = s.Delete()
-		return fmt.Errorf("%s: %w (service removed again)", what, err)
+		return fmt.Errorf("%w (service removed again)", err)
 	}
+	fmt.Printf("installed service %s (%s), automatic start, LocalSystem\n  exe:  %s\n  data: %s\n", svcName, displayName, exe, dataDir)
+	fmt.Println("start it now with: logiswitch start   (it also starts at every boot)")
+	return nil
+}
+
+// updateService points an existing, stopped service at the freshly copied
+// exe and reapplies its settings (an upgrade or repair).
+func updateService(s *mgr.Service, exe, dataDir string) error {
+	c, err := s.Config()
+	if err != nil {
+		return err
+	}
+	c.BinaryPathName = syscall.EscapeArg(exe)
+	c.StartType = mgr.StartAutomatic
+	c.DisplayName = displayName
+	c.Description = description
+	if err := s.UpdateConfig(c); err != nil {
+		return fmt.Errorf("update service config: %w", err)
+	}
+	if err := finishInstall(s); err != nil {
+		return err
+	}
+	fmt.Printf("updated existing service %s\n  exe:  %s\n  data: %s\n", svcName, exe, dataDir)
+	fmt.Println("start it with: logiswitch start")
+	return nil
+}
+
+// finishInstall sets the recovery actions and (re)creates the event source.
+func finishInstall(s *mgr.Service) error {
 	restart := mgr.RecoveryAction{Type: mgr.ServiceRestart, Delay: 5 * time.Second}
 	if err := s.SetRecoveryActions([]mgr.RecoveryAction{restart, restart, restart}, uint32((24 * time.Hour).Seconds())); err != nil {
-		return fail("set recovery actions", err)
+		return fmt.Errorf("set recovery actions: %w", err)
 	}
 	// A stale source from an earlier, partly removed install would make
 	// InstallAsEventCreate fail with "already exists".
 	_ = eventlog.Remove(svcName)
 	if err := eventlog.InstallAsEventCreate(svcName, eventlog.Error|eventlog.Warning|eventlog.Info); err != nil {
-		return fail("create event log source", err)
+		return fmt.Errorf("create event log source: %w", err)
 	}
-	fmt.Printf("installed service %s (%s), automatic start, LocalSystem\n  exe:  %s\n  data: %s\n", svcName, displayName, exe, dir)
-	fmt.Println("start it now with: logiswitch start   (it also starts at every boot)")
 	return nil
+}
+
+// installDir returns <ProgramFiles>\LogiSwitch.
+func installDir() (string, error) {
+	pf, err := paths.ProgramFiles()
+	if err != nil {
+		return "", fmt.Errorf("locate Program Files: %w", err)
+	}
+	return filepath.Join(pf, "LogiSwitch"), nil
+}
+
+// installExe copies src to <ProgramFiles>\LogiSwitch\logiswitch.exe (a
+// directory only admins can write, so the binary SYSTEM runs cannot be
+// swapped by a user) and returns that path. The directory gets the same
+// protected DACL as the data dir; the copy is written to a temp file there,
+// renamed into place and reset to owner Administrators with inherited ACEs.
+// If src already is that path, nothing is copied.
+func installExe(src string) (string, error) {
+	dir, err := installDir()
+	if err != nil {
+		return "", err
+	}
+	if err := logging.SecureDir(dir); err != nil {
+		return "", fmt.Errorf("securing %s: %w", dir, err)
+	}
+	dst := filepath.Join(dir, exeName)
+	if samePath(src, dst) {
+		return dst, nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(dir, "logiswitch-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		return "", fmt.Errorf("copy exe: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := logging.CheckFile(dst); err != nil {
+		return "", err
+	}
+	from, err := windows.UTF16PtrFromString(tmpName)
+	if err != nil {
+		return "", err
+	}
+	to, err := windows.UTF16PtrFromString(dst)
+	if err != nil {
+		return "", err
+	}
+	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		return "", fmt.Errorf("install exe to %s: %w", dst, err)
+	}
+	ok = true
+	if err := logging.ResetToInherited(dst); err != nil {
+		return "", fmt.Errorf("reset security of %s: %w", dst, err)
+	}
+	return dst, nil
 }
 
 func uninstall() error {
@@ -97,7 +222,11 @@ func uninstall() error {
 	if err := eventlog.Remove(svcName); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: remove event log source:", err)
 	}
-	fmt.Println("uninstalled service", svcName, "(data in", logging.DataDir(), "kept)")
+	fmt.Println("uninstalled service", svcName)
+	if dir, err := installDir(); err == nil {
+		fmt.Println("  program copy left in place:", filepath.Join(dir, exeName))
+	}
+	fmt.Println("  data left in place:", logging.DataDir())
 	return nil
 }
 
@@ -150,21 +279,11 @@ func openService(m *mgr.Mgr) (*mgr.Service, error) {
 }
 
 // stopAndWait asks the service to stop and waits up to stopTimeout for it
-// to report Stopped. A service that is not running is not an error.
+// to report Stopped, retrying the request while the service cannot accept
+// controls yet (e.g. still starting). A stopped service is not an error.
 func stopAndWait(s *mgr.Service) error {
-	st, err := s.Query()
-	if err != nil {
-		return err
-	}
-	if st.State == svc.Stopped {
-		return nil
-	}
-	if st.State != svc.StopPending {
-		if _, err := s.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
-			return fmt.Errorf("stop: %w", err)
-		}
-	}
 	deadline := time.Now().Add(stopTimeout)
+	sent := false
 	for {
 		st, err := s.Query()
 		if err != nil {
@@ -172,6 +291,17 @@ func stopAndWait(s *mgr.Service) error {
 		}
 		if st.State == svc.Stopped {
 			return nil
+		}
+		if !sent && st.State != svc.StopPending {
+			_, err := s.Control(svc.Stop)
+			switch {
+			case err == nil, errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE):
+				sent = true
+			case errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL):
+				// retry below until the deadline
+			default:
+				return fmt.Errorf("stop: %w", err)
+			}
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("service did not stop within %s", stopTimeout)
