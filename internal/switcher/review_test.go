@@ -24,7 +24,7 @@ func TestRepressDuringLeavingResends(t *testing.T) {
 	if n := r.o.callCount(kbPath, kbCH, 1); n != 2 {
 		t.Errorf("keyboard setHost writes = %d, want 2 (re-press resent)", n)
 	}
-	if r.logHas("own slot pressed") {
+	if r.logHas("own slot pressed") || !r.logHas("target pressed again while leaving") {
 		t.Errorf("re-press of the target treated as own slot:\n%s", r.log)
 	}
 }

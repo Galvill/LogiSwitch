@@ -78,10 +78,14 @@ func (s *Switcher) onKeyboardEvent(kb *device, m hidpp.Message) {
 	}
 	// While kb is leaving, its host is uncertain (the write may not have
 	// taken), so every press is acted on: a repeat of the target resends.
-	if !s.keyboardLeaving(kb, s.clk.Now()) && k == kb.host {
+	leaving := s.keyboardLeaving(kb, s.clk.Now())
+	if !leaving && k == kb.host {
 		// setHost to its own slot would make the keyboard reconnect.
 		s.log.Debug("own slot pressed; ignoring", "path", kb.path, "slot", k+1)
 		return
+	}
+	if leaving && k == kb.leavingTo {
+		s.log.Debug("target pressed again while leaving; resending", "path", kb.path, "slot", k+1)
 	}
 	ms := s.cfg.MouseSlotFor[k]
 	s.startSwitch([]*device{kb}, k, ms)
