@@ -29,7 +29,7 @@ type rotator struct {
 // OpenRotating opens (appending) a log file that is rotated to path+".1"
 // when a write would push it past maxBytes. One old file is kept.
 func OpenRotating(path string, maxBytes int64) (io.WriteCloser, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
 	r := &rotator{path: path, max: maxBytes}
@@ -39,8 +39,17 @@ func OpenRotating(path string, maxBytes int64) (io.WriteCloser, error) {
 	return r, nil
 }
 
-func (r *rotator) open() error {
-	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+func (r *rotator) open() error { return r.openFlags(0) }
+
+// openFlags opens the log file, first replacing anything at path that is
+// not a regular file (symlink, directory, device) with a fresh file.
+func (r *rotator) openFlags(extra int) error {
+	if fi, err := os.Lstat(r.path); err == nil && !fi.Mode().IsRegular() {
+		if err := os.Remove(r.path); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|extra, 0o600)
 	if err != nil {
 		return err
 	}
@@ -62,11 +71,13 @@ func (r *rotator) rotate() error {
 	if err := os.Rename(r.path, old); err != nil {
 		_ = os.Remove(old)
 		if err := os.Rename(r.path, old); err != nil {
-			// Could not rotate; reopen and keep appending.
-			if oerr := r.open(); oerr != nil {
-				return oerr
+			// Could not rotate; keep appending, but truncate once the file
+			// reaches twice the cap so it cannot grow without bound.
+			extra := 0
+			if r.size >= 2*r.max {
+				extra = os.O_TRUNC
 			}
-			return nil
+			return r.openFlags(extra)
 		}
 	}
 	return r.open()

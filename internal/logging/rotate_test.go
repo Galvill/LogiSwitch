@@ -118,3 +118,55 @@ func TestDefaultPath(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestRotationFailureStaysBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.log")
+	if err := os.MkdirAll(filepath.Join(path+".1", "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	w, err := OpenRotating(path, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	line := []byte(strings.Repeat("a", 19) + "\n")
+	for i := 0; i < 200; i++ {
+		if _, err := w.Write(line); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() > 2*100+int64(len(line)) {
+			t.Fatalf("file grew to %d", fi.Size())
+		}
+	}
+}
+
+func TestSymlinkReplaced(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "x.log")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skip(err)
+	}
+	w, err := OpenRotating(path, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, err := w.Write([]byte("log\n")); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "secret" {
+		t.Fatalf("target modified: %q", b)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("path not regular: %v %v", fi, err)
+	}
+}
