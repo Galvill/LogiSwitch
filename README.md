@@ -101,3 +101,7 @@ Log: `C:\ProgramData\LogiSwitch\logiswitch.log` (1 MiB, one `.1` kept). Errors, 
 23. (Optional) End logiswitch.exe in Task Manager; the service restarts after about 5 s.
 24. Upgrade while in use: with the service running, run `logiswitch install` again from Downloads: it says "stop the service first". With the service stopped but `logiswitch run` open from `C:\Program Files\LogiSwitch`, `install` from Downloads prints "cannot replace ...: file in use; ..." (not "run as administrator"). Close `run` and install again: it succeeds.
 25. `logiswitch uninstall` prints "uninstalled service LogiSwitch" plus the paths of the copy and data it leaves. `sc query LogiSwitch` reports it does not exist. Delete `C:\Program Files\LogiSwitch` manually if wanted.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
