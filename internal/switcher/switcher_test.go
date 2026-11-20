@@ -52,8 +52,9 @@ type entry struct {
 	dev     hid.Device
 	present bool
 	openErr error
-	mute    bool            // swallow writes so requests time out
-	calls   map[[2]byte]int // (feature, function) -> writes seen
+	mute    bool             // swallow writes so requests time out
+	swallow map[[2]byte]bool // (feature, function) writes accepted but not delivered
+	calls   map[[2]byte]int  // (feature, function) -> writes seen
 	handles []*handle
 }
 
@@ -75,7 +76,7 @@ func hidppInfo(path, product string) hid.Info {
 func (o *fakeOpener) add(info hid.Info, dev hid.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.entries[info.Path] = &entry{info: info, dev: dev, present: true, calls: map[[2]byte]int{}}
+	o.entries[info.Path] = &entry{info: info, dev: dev, present: true, calls: map[[2]byte]int{}, swallow: map[[2]byte]bool{}}
 	o.order = append(o.order, info.Path)
 }
 
@@ -87,6 +88,9 @@ func (o *fakeOpener) with(path string, f func(e *entry)) {
 
 func (o *fakeOpener) setPresent(path string, p bool) { o.with(path, func(e *entry) { e.present = p }) }
 func (o *fakeOpener) setMute(path string, m bool)    { o.with(path, func(e *entry) { e.mute = m }) }
+func (o *fakeOpener) setSwallow(path string, feat, fn byte, on bool) {
+	o.with(path, func(e *entry) { e.swallow[[2]byte{feat, fn}] = on })
+}
 func (o *fakeOpener) setOpenErr(path string, err error) {
 	o.with(path, func(e *entry) { e.openErr = err })
 }
@@ -193,6 +197,7 @@ func (h *handle) Write(report []byte, timeout time.Duration) error {
 	mute := h.e.mute
 	if m, ok := hidpp.Decode(report); ok {
 		h.e.calls[[2]byte{m.Feature, m.Function}]++
+		mute = mute || h.e.swallow[[2]byte{m.Feature, m.Function}]
 	}
 	h.o.mu.Unlock()
 	if mute {
@@ -274,6 +279,13 @@ func newHarness(t *testing.T, cfg config.Config) *harness {
 	return h
 }
 
+// tick runs one Tick and waits for the workers it started (opens, mouse
+// writes, probes) to post their results, committing them.
+func (h *harness) tick() {
+	h.s.Tick()
+	h.s.Settle()
+}
+
 func (h *harness) logHas(sub string) bool { return strings.Contains(h.log.String(), sub) }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -315,7 +327,7 @@ func TestTickDivertsKeyboard(t *testing.T) {
 	h.o.add(hidppInfo(mousePath, "MX_Master_3S"), mouse)
 	defer h.s.Release()
 
-	h.s.Tick()
+	h.tick()
 
 	if !allDiverted(kb) {
 		t.Fatal("keyboard D1-D3 not diverted after Tick")
@@ -337,8 +349,8 @@ func TestTickDivertsKeyboard(t *testing.T) {
 
 	// Steady state: further Ticks re-check D1 only, no re-divert, no reopen.
 	before := h.o.callCount(kbPath, 8, 3)
-	h.s.Tick()
-	h.s.Tick()
+	h.tick()
+	h.tick()
 	if got := h.o.callCount(kbPath, 8, 3); got != before {
 		t.Errorf("setCidReporting calls %d -> %d on an already-diverted keyboard", before, got)
 	}
@@ -357,13 +369,13 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 		h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
 		defer h.s.Release()
 
-		h.s.Tick()
+		h.tick()
 		kb.Disconnect()
 		kb.Reconnect() // clears diversion, same handle still usable
 		if allDiverted(kb) {
 			t.Fatal("precondition: Reconnect should clear diversion")
 		}
-		h.s.Tick()
+		h.tick()
 		if !allDiverted(kb) {
 			t.Fatal("not re-diverted after reconnect")
 		}
@@ -378,7 +390,7 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 		h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
 		defer h.s.Release()
 
-		h.s.Tick()
+		h.tick()
 		controlsScans := h.o.callCount(kbPath, 8, 0)
 		if controlsScans != 1 {
 			t.Fatalf("first open: getCount calls = %d, want 1", controlsScans)
@@ -386,7 +398,7 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 
 		kb.Disconnect()
 		h.o.setPresent(kbPath, false)
-		h.s.Tick()
+		h.tick()
 		if n := h.o.openHandles(kbPath); n != 0 {
 			t.Fatalf("handle not closed when path vanished (%d open)", n)
 		}
@@ -396,7 +408,7 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 
 		kb.Reconnect()
 		h.o.setPresent(kbPath, true)
-		h.s.Tick()
+		h.tick()
 		if !allDiverted(kb) {
 			t.Fatal("not re-diverted after collection returned")
 		}
@@ -414,9 +426,9 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 		h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
 		defer h.s.Release()
 
-		h.s.Tick()
+		h.tick()
 		kb.Disconnect() // writes now fail, path stays enumerated
-		h.s.Tick()
+		h.tick()
 		if _, ok := h.s.devs[kbPath]; ok {
 			t.Fatal("keyboard with failing I/O still registered")
 		}
@@ -425,7 +437,7 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 		}
 		kb.Reconnect()
 		h.clk.Advance(3 * time.Second)
-		h.s.Tick()
+		h.tick()
 		if !allDiverted(kb) {
 			t.Fatal("not re-diverted after I/O error")
 		}
@@ -446,7 +458,7 @@ func TestTickIgnoresNonTarget(t *testing.T) {
 	defer h.s.Release()
 
 	for i := 0; i < 3; i++ {
-		h.s.Tick()
+		h.tick()
 		h.clk.Advance(10 * time.Second)
 	}
 	if n := h.o.openCount(`\\?\hid#col01`); n != 0 {
@@ -476,7 +488,7 @@ func TestTickRetriesTimedOutDevice(t *testing.T) {
 	defer h.s.Release()
 
 	h.o.setMute(kbPath, true)
-	h.s.Tick() // FeatureIndex times out
+	h.tick() // FeatureIndex times out
 	if _, ok := h.s.devs[kbPath]; ok {
 		t.Fatal("timed-out device registered")
 	}
@@ -485,13 +497,13 @@ func TestTickRetriesTimedOutDevice(t *testing.T) {
 	}
 	h.o.setMute(kbPath, false)
 
-	h.s.Tick() // throttled: too soon after the failure
+	h.tick() // throttled: too soon after the failure
 	if n := h.o.openCount(kbPath); n != 1 {
 		t.Errorf("retried immediately: opens = %d, want 1", n)
 	}
 
 	h.clk.Advance(2 * time.Second)
-	h.s.Tick()
+	h.tick()
 	if !allDiverted(kb) {
 		t.Fatal("not diverted on retry after timeout")
 	}
@@ -507,15 +519,15 @@ func TestTickRetriesFailedOpen(t *testing.T) {
 	defer h.s.Release()
 
 	h.o.setOpenErr(kbPath, errors.New("open: file not found"))
-	h.s.Tick()
+	h.tick()
 	h.clk.Advance(500 * time.Millisecond)
-	h.s.Tick()
+	h.tick()
 	if n := h.o.openCount(kbPath); n != 1 {
 		t.Errorf("opens = %d, want 1 (throttled)", n)
 	}
 	h.o.setOpenErr(kbPath, nil)
 	h.clk.Advance(2 * time.Second)
-	h.s.Tick()
+	h.tick()
 	if !allDiverted(kb) {
 		t.Fatal("not diverted after open recovered")
 	}
@@ -527,13 +539,13 @@ func TestTickDropsClosedConn(t *testing.T) {
 	h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
 	defer h.s.Release()
 
-	h.s.Tick()
+	h.tick()
 	old := h.s.devs[kbPath]
 	h.o.kill(kbPath)
 	kb.Reconnect() // device comes back with diversion cleared
 	waitFor(t, "conn-closed event", func() bool { return len(h.s.gone) == 1 })
 
-	h.s.Tick() // drains the closure, then reopens the (still enumerated) path
+	h.tick() // drains the closure, then reopens the (still enumerated) path
 	d := h.s.devs[kbPath]
 	if d == nil || d == old {
 		t.Fatalf("closed conn not replaced: %+v", d)
@@ -552,15 +564,15 @@ func TestTickRoutesKeyboardEvents(t *testing.T) {
 	h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
 	defer h.s.Release()
 
-	h.s.Tick()
+	h.tick()
 	kb.Press(0xD2)
 	waitFor(t, "press events", func() bool { return len(h.s.events) == 2 })
-	h.s.Tick()
+	h.tick()
 	if len(h.s.events) != 0 {
 		t.Error("Tick did not drain events")
 	}
-	if !h.logHas("keyboard event") || !h.logHas("cids=[0xD2]") {
-		t.Errorf("press not routed to keyboard handler:\n%s", h.log)
+	if got := kb.SetHostCalls(); len(got) != 1 || got[0] != 1 {
+		t.Errorf("keyboard setHost calls = %v, want [1] (press routed to the switch handler)", got)
 	}
 }
 
@@ -571,7 +583,7 @@ func TestReleaseUndiverts(t *testing.T) {
 	h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
 	h.o.add(hidppInfo(mousePath, "MX_Master_3S"), mouse)
 
-	h.s.Tick()
+	h.tick()
 	if !allDiverted(kb) {
 		t.Fatal("precondition: diverted")
 	}
@@ -589,7 +601,7 @@ func TestReleaseToleratesGoneKeyboard(t *testing.T) {
 	h := newHarness(t, config.Default())
 	kb := hidpptest.NewKeyboard(0)
 	h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
-	h.s.Tick()
+	h.tick()
 	kb.Disconnect()
 	h.s.Release() // undivert fails; must still close
 	if h.o.openHandles(kbPath) != 0 {
@@ -631,10 +643,10 @@ func TestReopenStillDivertedReadsHost(t *testing.T) {
 	h.o.add(hidppInfo(kbPath, "MX_Keys"), kb)
 	defer h.s.Release()
 
-	h.s.Tick()
+	h.tick()
 	h.o.kill(kbPath) // handle dies, keyboard keeps its diversion
 	waitFor(t, "conn-closed event", func() bool { return len(h.s.gone) == 1 })
-	h.s.Tick()
+	h.tick()
 	d := h.s.devs[kbPath]
 	if d == nil || !d.diverted || d.host != 2 {
 		t.Fatalf("reopened keyboard = %+v, want diverted with host 2", d)

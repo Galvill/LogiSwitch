@@ -2,9 +2,15 @@
 // keyboard's Easy-Switch keys diverted to software, and moves the mouse to
 // follow them.
 //
-// All switcher state is owned by one goroutine: Run, or the test calling Tick
-// directly. Per-device reader goroutines only forward notifications and
-// "connection closed" events into channels that the owner drains.
+// All switcher state is owned by one goroutine: Run, or the caller of Tick,
+// Settle and Release. Other goroutines never touch it:
+//   - per-device reader goroutines forward notifications and "connection
+//     closed" into channels the owner drains;
+//   - worker goroutines do slow I/O (opening and classifying a new path,
+//     mouse setHost writes, mouse HostInfo probes) and post one result each
+//     back to the owner, which commits it.
+//
+// So a keyboard press is never queued behind mouse or unknown-device I/O.
 package switcher
 
 import (
@@ -59,7 +65,9 @@ type class struct {
 	chIdx, rpIdx byte // CHANGE_HOST, REPROG_CONTROLS_V4 indexes (rpIdx 0 if absent)
 }
 
-// device is one open, classified HID++ device.
+// device is one open, classified HID++ device. Once committed its mutable
+// fields belong to the owner goroutine; workers only use conn and the
+// immutable path and class.
 type device struct {
 	path, product string
 	class
@@ -78,7 +86,7 @@ type retry struct {
 	failures int
 }
 
-// Switcher is the device registry and upkeep loop.
+// Switcher is the device registry, upkeep loop and switch logic.
 type Switcher struct {
 	opener hid.Opener
 	cfg    config.Config
@@ -89,12 +97,18 @@ type Switcher struct {
 	known   map[string]class   // classification cache, process lifetime
 	ignored map[string]bool    // paths that answer but lack the features
 	retries map[string]retry   // throttled paths
+	present map[string]bool    // candidate paths seen by the last Enumerate
+	opening map[string]bool    // paths with an open worker in flight
+	pend    *pendingSwitch     // mouse switch not yet delivered
+	gen     int                // pendingSwitch generation counter
 
-	events chan event   // notifications from reader goroutines
-	gone   chan *device // reader goroutines report their conn closed
-	quit   chan struct{}
-	wg     sync.WaitGroup
-	once   sync.Once
+	events   chan event   // notifications from reader goroutines
+	gone     chan *device // reader goroutines report their conn closed
+	results  chan any     // worker results: openResult, sendResult, probeResult
+	inflight int          // workers started whose result is not yet handled
+	quit     chan struct{}
+	wg       sync.WaitGroup // readers and workers
+	released bool
 }
 
 // New returns a Switcher; it does nothing until Tick or Run.
@@ -108,14 +122,17 @@ func New(o hid.Opener, cfg config.Config, clk Clock, log *slog.Logger) *Switcher
 		known:   map[string]class{},
 		ignored: map[string]bool{},
 		retries: map[string]retry{},
+		present: map[string]bool{},
+		opening: map[string]bool{},
 		events:  make(chan event, 64),
 		gone:    make(chan *device, 16),
+		results: make(chan any, 16),
 		quit:    make(chan struct{}),
 	}
 }
 
-// Run ticks every PollInterval and handles device events until ctx is done,
-// then calls Release.
+// Run ticks every PollInterval and handles device events and worker results
+// until ctx is done, then calls Release.
 func (s *Switcher) Run(ctx context.Context) {
 	t := time.NewTicker(s.cfg.PollInterval)
 	defer t.Stop()
@@ -129,15 +146,22 @@ func (s *Switcher) Run(ctx context.Context) {
 			s.handleEvent(e)
 		case d := <-s.gone:
 			s.handleGone(d)
+		case r := <-s.results:
+			s.handleResult(r)
 		case <-t.C:
 			s.Tick()
 		}
 	}
 }
 
-// Tick drains pending events, then does one upkeep pass: close devices that
-// vanished, re-check diversion on open keyboards, open and classify new paths.
+// Tick drains queued events and results, then does one upkeep pass: close
+// devices that vanished, re-check diversion on open keyboards, start opening
+// new paths, and push any pending mouse switch along. It does not wait for
+// the workers it starts (see Settle). After Release it does nothing.
 func (s *Switcher) Tick() {
+	if s.released {
+		return
+	}
 	s.drain()
 	infos, err := s.opener.Enumerate(logitechVID)
 	if err != nil {
@@ -154,8 +178,12 @@ func (s *Switcher) Tick() {
 			present[in.Path] = in
 		}
 	}
+	s.present = map[string]bool{}
+	for p := range present {
+		s.present[p] = true
+	}
 	for p, d := range s.devs {
-		if _, ok := present[p]; !ok {
+		if !s.present[p] {
 			s.drop(d, "removed")
 		}
 	}
@@ -164,56 +192,84 @@ func (s *Switcher) Tick() {
 	for _, p := range paths {
 		if d := s.devs[p]; d != nil {
 			if d.role == roleKeyboard {
-				if err := s.ensureDiverted(d); err != nil {
+				took, err := ensureDiverted(d)
+				if err != nil {
 					s.drop(d, fmt.Sprintf("divert check failed: %v", err))
+				} else if took {
+					s.logTakeover(d)
 				}
 			}
 			continue
 		}
-		if s.ignored[p] {
+		if s.ignored[p] || s.opening[p] {
 			continue
 		}
 		if r, ok := s.retries[p]; ok && now.Before(r.at) {
 			continue
 		}
-		s.open(present[p])
+		s.startOpen(present[p])
+	}
+	s.upkeepPending(now)
+}
+
+// Settle blocks until every worker started so far has posted its result and
+// the result is committed (including workers those results start), then
+// handles queued events. It is for one-shot commands that need a complete
+// picture (list, set N) and for tests; Run never calls it. It must be called
+// on the owner goroutine, and does nothing after Release.
+func (s *Switcher) Settle() {
+	for !s.released {
+		s.drain()
+		if s.inflight == 0 {
+			return
+		}
+		s.handleResult(<-s.results)
 	}
 }
 
-// Release undiverts D1-D3 on open keyboards and closes every device. It is
-// safe to call more than once.
+// Release undiverts D1-D3 on open keyboards and closes every device. It
+// first waits for in-flight workers so that a keyboard still being opened is
+// released too. It must be called on the owner goroutine (Run does so
+// itself); it is safe to call more than once, and Tick and Settle do nothing
+// afterwards.
 func (s *Switcher) Release() {
-	s.once.Do(func() {
-		paths := make([]string, 0, len(s.devs))
-		for p := range s.devs {
-			paths = append(paths, p)
+	if s.released {
+		return
+	}
+	s.released = true
+	for s.inflight > 0 {
+		s.handleResult(<-s.results)
+	}
+	paths := make([]string, 0, len(s.devs))
+	for p := range s.devs {
+		paths = append(paths, p)
+	}
+	slices.Sort(paths)
+	for _, p := range paths {
+		d := s.devs[p]
+		if d.role != roleKeyboard {
+			continue
 		}
-		slices.Sort(paths)
-		for _, p := range paths {
-			d := s.devs[p]
-			if d.role != roleKeyboard {
-				continue
-			}
-			var errs []error
-			for _, cid := range hidpp.HostSwitchCIDs {
-				if err := d.conn.SetDiverted(d.rpIdx, cid, false); err != nil {
-					errs = append(errs, err)
-				}
-			}
-			if err := errors.Join(errs...); err != nil {
-				// Expected when the keyboard has already gone.
-				s.log.Info("undivert failed", "path", p, "err", err)
-			} else {
-				s.log.Info("keys released", "path", p)
+		var errs []error
+		for _, cid := range hidpp.HostSwitchCIDs {
+			if err := d.conn.SetDiverted(d.rpIdx, cid, false); err != nil {
+				errs = append(errs, err)
 			}
 		}
-		close(s.quit)
-		for _, d := range s.devs {
-			d.conn.Close()
+		if err := errors.Join(errs...); err != nil {
+			// Expected when the keyboard has already gone.
+			s.log.Info("undivert failed", "path", p, "err", err)
+		} else {
+			s.log.Info("keys released", "path", p)
 		}
-		s.devs = map[string]*device{}
-		s.wg.Wait()
-	})
+	}
+	close(s.quit)
+	for _, d := range s.devs {
+		d.conn.Close()
+	}
+	s.devs = map[string]*device{}
+	s.pend = nil
+	s.wg.Wait()
 }
 
 func isCandidate(in hid.Info) bool {
@@ -221,9 +277,15 @@ func isCandidate(in hid.Info) bool {
 		(in.UsagePage == 0xFF43 && in.Usage == 0x0202 || in.UsagePage == 0xFF00 && in.Usage == 0x0002)
 }
 
-// drain handles every queued event and closure without blocking.
+// drain handles every queued result, event and closure without blocking.
 func (s *Switcher) drain() {
 	for {
+		select {
+		case r := <-s.results:
+			s.handleResult(r)
+			continue
+		default:
+		}
 		select {
 		case e := <-s.events:
 			s.handleEvent(e)
@@ -250,11 +312,42 @@ func (s *Switcher) drainEvents() {
 	}
 }
 
+// goWork runs f on a worker goroutine, which posts f's result to the owner.
+// Every started worker posts exactly one result unless quit is closed, which
+// only happens after Release has collected them all.
+func (s *Switcher) goWork(f func() any) {
+	s.inflight++
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		r := f()
+		select {
+		case s.results <- r:
+		case <-s.quit:
+			if o, ok := r.(openResult); ok && o.d != nil {
+				o.d.conn.Close()
+			}
+		}
+	}()
+}
+
+func (s *Switcher) handleResult(r any) {
+	s.inflight--
+	switch r := r.(type) {
+	case openResult:
+		s.commitOpen(r)
+	case sendResult:
+		s.handleSend(r)
+	case probeResult:
+		s.handleProbe(r)
+	}
+}
+
 func (s *Switcher) current(d *device) bool { return s.devs[d.path] == d }
 
 func (s *Switcher) handleEvent(e event) {
 	d, m := e.d, e.m
-	if !s.current(d) {
+	if !s.current(d) || s.released {
 		return
 	}
 	if d.role == roleKeyboard && m.Feature == d.rpIdx {
@@ -262,12 +355,6 @@ func (s *Switcher) handleEvent(e event) {
 		return
 	}
 	s.log.Debug("ignoring notification", "path", d.path, "feature", m.Feature, "fn", m.Function)
-}
-
-// onKeyboardEvent receives REPROG_CONTROLS_V4 notifications from a keyboard.
-// Press handling is added in switch.go.
-func (s *Switcher) onKeyboardEvent(kb *device, m hidpp.Message) {
-	s.log.Debug("keyboard event", "path", kb.path, "cids", fmtCIDs(hidpp.DivertedCIDs(m)))
 }
 
 func (s *Switcher) handleGone(d *device) {
@@ -285,151 +372,9 @@ func (s *Switcher) drop(d *device, reason string) {
 		delete(s.devs, d.path)
 	}
 	s.log.Info(d.role.String()+" closed", "path", d.path, "reason", reason)
-}
-
-// open opens and classifies a path. On a transient failure the path is
-// retried after retryInterval; a device lacking the features is ignored for
-// the process lifetime.
-func (s *Switcher) open(in hid.Info) {
-	hd, err := s.opener.Open(in.Path)
-	if err != nil {
-		s.failed(in.Path, "open failed", err)
-		return
-	}
-	conn := hidpp.NewConn(hd, bleDevIdx)
-	c, err := s.classify(conn, in.Path)
-	if errors.Is(err, errNotTarget) {
-		conn.Close()
-		s.ignored[in.Path] = true
-		s.log.Info("ignoring device without CHANGE_HOST", "path", in.Path, "product", in.Product)
-		return
-	}
-	if err != nil {
-		conn.Close()
-		s.failed(in.Path, "classify failed", err)
-		return
-	}
-	delete(s.retries, in.Path)
-	s.known[in.Path] = c
-	d := &device{path: in.Path, product: in.Product, class: c, conn: conn, host: -1}
 	if d.role == roleMouse {
-		if _, cur, err := conn.HostInfo(c.chIdx); err == nil {
-			d.host = cur
-		} else {
-			s.log.Debug("mouse host unknown", "path", in.Path, "err", err)
-		}
+		s.mouseDropped(d)
 	}
-	s.devs[in.Path] = d
-	s.wg.Add(1)
-	go s.forward(d)
-	s.log.Info(d.role.String()+" opened", "path", d.path, "product", d.product,
-		"changeHostIdx", d.chIdx, "reprogIdx", d.rpIdx)
-	if d.role == roleKeyboard {
-		if err := s.ensureDiverted(d); err != nil {
-			s.drop(d, fmt.Sprintf("divert failed: %v", err))
-		}
-	}
-}
-
-// failed records a transient failure on path and closes nothing (the caller
-// already has). The first failure in a row logs at warn, repeats at debug.
-func (s *Switcher) failed(path, what string, err error) {
-	r := s.retries[path]
-	r.failures++
-	r.at = s.clk.Now().Add(retryInterval)
-	s.retries[path] = r
-	lvl := slog.LevelDebug
-	if r.failures == 1 {
-		lvl = slog.LevelWarn
-	}
-	s.log.Log(context.Background(), lvl, what+"; will retry", "path", path, "err", err, "failures", r.failures)
-}
-
-var errNotTarget = errors.New("switcher: device lacks CHANGE_HOST")
-
-// classify determines the role of the device on conn. A path classified
-// earlier is only re-verified by its role's key feature index.
-func (s *Switcher) classify(conn *hidpp.Conn, path string) (class, error) {
-	if c, ok := s.known[path]; ok {
-		feat, want := uint16(hidpp.FeatReprogV4), c.rpIdx
-		if c.role == roleMouse {
-			feat, want = hidpp.FeatChangeHost, c.chIdx
-		}
-		fi, err := conn.FeatureIndex(feat)
-		if err != nil && !errors.Is(err, hidpp.ErrNoFeature) {
-			return class{}, err
-		}
-		if err == nil && fi == want {
-			return c, nil
-		}
-		s.log.Info("device changed; re-classifying", "path", path)
-		delete(s.known, path)
-	}
-	ch, err := conn.FeatureIndex(hidpp.FeatChangeHost)
-	if errors.Is(err, hidpp.ErrNoFeature) {
-		return class{}, errNotTarget
-	}
-	if err != nil {
-		return class{}, err
-	}
-	rp, err := conn.FeatureIndex(hidpp.FeatReprogV4)
-	if errors.Is(err, hidpp.ErrNoFeature) {
-		return class{role: roleMouse, chIdx: ch}, nil
-	}
-	if err != nil {
-		return class{}, err
-	}
-	ctrls, err := conn.Controls(rp)
-	if err != nil {
-		return class{}, err
-	}
-	if hasHostKeys(ctrls) {
-		return class{role: roleKeyboard, chIdx: ch, rpIdx: rp}, nil
-	}
-	return class{role: roleMouse, chIdx: ch, rpIdx: rp}, nil
-}
-
-// hasHostKeys reports whether D1-D3 are all present and temp-divertable.
-func hasHostKeys(ctrls []hidpp.Control) bool {
-	for _, cid := range hidpp.HostSwitchCIDs {
-		if !slices.ContainsFunc(ctrls, func(c hidpp.Control) bool {
-			return c.CID == cid && c.Flags&flagTempDivertable != 0
-		}) {
-			return false
-		}
-	}
-	return true
-}
-
-// ensureDiverted checks D1 and, if it is not diverted, diverts D1-D3 and
-// caches the keyboard's current host. The host is also read when it is not
-// yet known (a fresh handle on a keyboard that kept its diversion).
-func (s *Switcher) ensureDiverted(kb *device) error {
-	on, err := kb.conn.Diverted(kb.rpIdx, hidpp.HostSwitchCIDs[0])
-	if err != nil {
-		return err
-	}
-	kb.diverted = on
-	if !on {
-		for _, cid := range hidpp.HostSwitchCIDs {
-			if err := kb.conn.SetDiverted(kb.rpIdx, cid, true); err != nil {
-				return err
-			}
-		}
-		kb.diverted = true
-	}
-	if on && kb.host >= 0 {
-		return nil
-	}
-	_, cur, err := kb.conn.HostInfo(kb.chIdx)
-	if err != nil {
-		return err
-	}
-	kb.host = cur
-	if !on {
-		s.log.Info("keys taken over", "path", kb.path, "product", kb.product, "slot", cur+1)
-	}
-	return nil
 }
 
 // forward relays d's notifications to the owner goroutine, then reports the
