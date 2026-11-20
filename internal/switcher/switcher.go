@@ -74,6 +74,7 @@ type device struct {
 	conn     *hidpp.Conn
 	host     int  // current host, 0-based; -1 unknown
 	diverted bool // keyboard: D1-D3 diverted as of the last check
+	leaving  bool // keyboard: we changed its host; it is on its way out
 }
 
 type event struct {
@@ -191,7 +192,7 @@ func (s *Switcher) Tick() {
 	now := s.clk.Now()
 	for _, p := range paths {
 		if d := s.devs[p]; d != nil {
-			if d.role == roleKeyboard {
+			if d.role == roleKeyboard && !d.leaving {
 				took, err := ensureDiverted(d)
 				if err != nil {
 					s.drop(d, fmt.Sprintf("divert check failed: %v", err))

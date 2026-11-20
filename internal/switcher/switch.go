@@ -95,6 +95,7 @@ func (s *Switcher) startSwitch(kbs []*device, kbSlot, mouseSlot int) {
 			continue
 		}
 		kb.host = kbSlot // it is leaving for kbSlot
+		kb.leaving = true
 	}
 }
 

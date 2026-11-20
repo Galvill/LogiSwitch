@@ -300,9 +300,13 @@ func TestPendingSupersededByNewPress(t *testing.T) {
 		t.Fatalf("pending = %+v, want slot 1", p)
 	}
 
-	// The keyboard comes back (user switched back to this computer) and the
-	// user presses slot 3 before the mouse has woken.
+	// The keyboard leaves and comes back (user switched back to this
+	// computer; the pending switch is cancelled) and the user presses slot 3
+	// before the mouse has woken.
+	r.o.setPresent(kbPath, false)
+	r.tick()
 	r.kb.Reconnect()
+	r.o.setPresent(kbPath, true)
 	r.clk.Advance(3 * time.Second)
 	r.tick()
 	if d := r.s.devs[kbPath]; d == nil || d.host != 1 {
@@ -444,5 +448,52 @@ func TestRunHandlesPress(t *testing.T) {
 	waitFor(t, "switch", func() bool { return len(kb.SetHostCalls()) == 1 && len(mouse.SetHostCalls()) == 1 })
 	if !eq(kb.SetHostCalls(), 2) || !eq(mouse.SetHostCalls(), 2) {
 		t.Errorf("kb=%v mouse=%v, want [2] each", kb.SetHostCalls(), mouse.SetHostCalls())
+	}
+}
+
+func TestPendingClearedWhenKeyboardReturns(t *testing.T) {
+	r := newRig(t, config.Default(), 0, 0, false) // mouse asleep
+	r.press(0xD2)
+	r.tick()
+	if r.s.pend == nil {
+		t.Fatal("no pending switch after press")
+	}
+	// The keyboard leaves, then comes back to this PC.
+	r.o.setPresent(kbPath, false)
+	r.clk.Advance(5 * time.Second)
+	r.tick()
+	r.kb.Reconnect()
+	r.o.setPresent(kbPath, true)
+	r.clk.Advance(5 * time.Second)
+	r.tick()
+	if r.s.devs[kbPath] == nil {
+		t.Fatal("keyboard not reopened")
+	}
+	if r.s.pend != nil {
+		t.Fatalf("pending not cleared: %+v", r.s.pend)
+	}
+	if !r.logHas("pending mouse switch cancelled: keyboard returned") {
+		t.Errorf("want cancel log:\n%s", r.log)
+	}
+	r.o.setPresent(mousePath, true)
+	r.clk.Advance(5 * time.Second)
+	r.tick()
+	if got := r.mouse.SetHostCalls(); len(got) != 0 {
+		t.Errorf("mouse got setHost %v after the keyboard returned", got)
+	}
+}
+
+func TestNoDivertCheckAfterKeyboardLeaves(t *testing.T) {
+	r := newRig(t, config.Default(), 0, 0, true)
+	kd := r.s.devs[kbPath]
+	r.inject(0xD2) // switches the keyboard; it is still registered until its conn closes
+	if !kd.leaving {
+		t.Fatal("keyboard not marked leaving after its host changed")
+	}
+	before := r.o.callCount(kbPath, kbRP, 2)
+	r.s.Tick()
+	r.s.Settle()
+	if after := r.o.callCount(kbPath, kbRP, 2); after != before {
+		t.Errorf("getCidReporting calls %d -> %d, want none after the keyboard left", before, after)
 	}
 }

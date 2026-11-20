@@ -103,6 +103,12 @@ func (s *Switcher) commitOpen(r openResult) {
 	go s.forward(d)
 	s.log.Info(d.role.String()+" opened", "path", d.path, "product", d.product,
 		"changeHostIdx", d.chIdx, "reprogIdx", d.rpIdx)
+	if d.role == roleKeyboard && s.pend != nil && !s.released {
+		// The keyboard is back on this PC after the press, so the user did
+		// not move on; the mouse stays.
+		s.log.Info("pending mouse switch cancelled: keyboard returned", "path", d.path)
+		s.pend = nil
+	}
 	if d.role == roleMouse && !s.released {
 		// A mouse that wakes up while a switch is pending is sent on at once.
 		s.upkeepPending(s.clk.Now())
