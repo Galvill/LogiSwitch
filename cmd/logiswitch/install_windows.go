@@ -193,6 +193,12 @@ func installExe(src string) (string, error) {
 		return "", err
 	}
 	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+			// We already created a file in this admin-only directory, so
+			// this is not missing elevation: the old exe is running. Not
+			// wrapped with %w, so exitFor does not say "run as administrator".
+			return "", fmt.Errorf("cannot replace %s: file in use; stop the service (logiswitch stop) and close any `logiswitch run`, then retry (%v)", dst, err)
+		}
 		return "", fmt.Errorf("install exe to %s: %w", dst, err)
 	}
 	ok = true

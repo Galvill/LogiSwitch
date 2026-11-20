@@ -68,9 +68,9 @@ func SecureDataDir(dir string) (warnings []string, err error) {
 					return warnings, fmt.Errorf("data dir: remove untrusted %s: %w", p, rerr)
 				}
 				if errors.Is(err, errUntrustedOwner) {
-					warnings = append(warnings, "config.json not owned by SYSTEM/Administrators — removed, using defaults")
+					warnings = append(warnings, "config.json not owned by SYSTEM/Administrators - removed, using defaults")
 				} else {
-					warnings = append(warnings, fmt.Sprintf("config.json rejected (%v) — removed, using defaults", err))
+					warnings = append(warnings, fmt.Sprintf("config.json rejected (%v) - removed, using defaults", err))
 				}
 				continue
 			}
