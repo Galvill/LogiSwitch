@@ -102,6 +102,12 @@ Log: `C:\ProgramData\LogiSwitch\logiswitch.log` (1 MiB, one `.1` kept). Errors, 
 24. Upgrade while in use: with the service running, run `logiswitch install` again from Downloads: it says "stop the service first". With the service stopped but `logiswitch run` open from `C:\Program Files\LogiSwitch`, `install` from Downloads prints "cannot replace ...: file in use; ..." (not "run as administrator"). Close `run` and install again: it succeeds.
 25. `logiswitch uninstall` prints "uninstalled service LogiSwitch" plus the paths of the copy and data it leaves. `sc query LogiSwitch` reports it does not exist. Delete `C:\Program Files\LogiSwitch` manually if wanted.
 
+## Releases and versioning
+
+Prebuilt binaries are attached to each [GitHub release](https://github.com/Galvill/LogiSwitch/releases): download `logiswitch-<version>-windows-amd64.zip`, check it against the `.sha256` file, and run `logiswitch.exe install` from an elevated prompt. `logiswitch version` prints the version; the service logs it at start.
+
+Versions are managed by [release-please](https://github.com/googleapis/release-please). Commits on `main` use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:` …). release-please keeps a release PR open that bumps the version and updates `CHANGELOG.md`; merging it tags the release, and CI builds `logiswitch.exe` and attaches it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
