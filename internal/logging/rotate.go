@@ -1,4 +1,5 @@
-// Package logging provides a size-capped rotating log file writer.
+// Package logging provides a size-capped rotating log file writer and the
+// hardening of the LogiSwitch data directory.
 package logging
 
 import (
@@ -8,14 +9,17 @@ import (
 	"sync"
 )
 
-// DefaultPath returns %ProgramData%\LogiSwitch\logiswitch.log.
-func DefaultPath() string {
+// DataDir returns %ProgramData%\LogiSwitch (fallback C:\ProgramData\LogiSwitch).
+func DataDir() string {
 	pd := os.Getenv("ProgramData")
 	if pd == "" {
 		pd = `C:\ProgramData`
 	}
-	return filepath.Join(pd, "LogiSwitch", "logiswitch.log")
+	return filepath.Join(pd, "LogiSwitch")
 }
+
+// DefaultPath returns %ProgramData%\LogiSwitch\logiswitch.log.
+func DefaultPath() string { return filepath.Join(DataDir(), "logiswitch.log") }
 
 type rotator struct {
 	mu     sync.Mutex
@@ -27,11 +31,17 @@ type rotator struct {
 }
 
 // OpenRotating opens (appending) a log file that is rotated to path+".1"
-// when a write would push it past maxBytes. One old file is kept.
+// when a write would push it past maxBytes. One old file is kept. Anything
+// at path that is not a plain file (link, hard link, directory) is removed
+// first (see CheckFile), and on Windows the opened handle itself is checked
+// before use.
 func OpenRotating(path string, maxBytes int64) (io.WriteCloser, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
+	// path+".1" is never opened, only renamed onto (which replaces a link
+	// rather than writing through it), so cleaning it is best effort.
+	_ = CheckFile(path + ".1")
 	r := &rotator{path: path, max: maxBytes}
 	if err := r.open(); err != nil {
 		return nil, err
@@ -39,47 +49,52 @@ func OpenRotating(path string, maxBytes int64) (io.WriteCloser, error) {
 	return r, nil
 }
 
-func (r *rotator) open() error { return r.openFlags(0) }
-
-// openFlags opens the log file, first replacing anything at path that is
-// not a regular file (symlink, directory, device) with a fresh file.
-func (r *rotator) openFlags(extra int) error {
-	if fi, err := os.Lstat(r.path); err == nil && !fi.Mode().IsRegular() {
-		if err := os.Remove(r.path); err != nil {
-			return err
-		}
-	}
-	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|extra, 0o600)
+// open opens the log file through the platform hook and positions the
+// writer at its end.
+func (r *rotator) open() error {
+	f, err := openLog(r.path)
 	if err != nil {
 		return err
 	}
-	st, err := f.Stat()
+	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		f.Close()
 		return err
 	}
-	r.f, r.size = f, st.Size()
+	r.f, r.size = f, size
 	return nil
 }
 
+// rotate renames the current file to path+".1" and opens a fresh one. If
+// the rename fails it keeps writing to the open handle, truncating it once
+// it reaches twice the cap so it cannot grow without bound. The file is
+// never reopened by name with O_TRUNC, so a name swapped under us cannot
+// redirect the truncation.
 func (r *rotator) rotate() error {
+	old := r.path + ".1"
+	_ = CheckFile(old)
+	err := os.Rename(r.path, old)
+	if err != nil {
+		_ = os.Remove(old)
+		err = os.Rename(r.path, old)
+	}
+	if err != nil {
+		if r.size < 2*r.max {
+			return nil
+		}
+		if err := r.f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := r.f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		r.size = 0
+		return nil
+	}
 	// Drop the handle regardless of Close's result so a failed Close
 	// cannot leave a dead writer behind.
 	_ = r.f.Close()
 	r.f = nil
-	old := r.path + ".1"
-	if err := os.Rename(r.path, old); err != nil {
-		_ = os.Remove(old)
-		if err := os.Rename(r.path, old); err != nil {
-			// Could not rotate; keep appending, but truncate once the file
-			// reaches twice the cap so it cannot grow without bound.
-			extra := 0
-			if r.size >= 2*r.max {
-				extra = os.O_TRUNC
-			}
-			return r.openFlags(extra)
-		}
-	}
 	return r.open()
 }
 
