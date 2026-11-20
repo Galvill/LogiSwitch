@@ -1,10 +1,12 @@
 package switcher
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 
+	"logiswitch/internal/hid"
 	"logiswitch/internal/hidpp"
 )
 
@@ -74,7 +76,9 @@ func (s *Switcher) onKeyboardEvent(kb *device, m hidpp.Message) {
 		s.log.Debug("keyboard event without host key", "path", kb.path, "cids", fmtCIDs(cids))
 		return
 	}
-	if k == kb.host {
+	// While kb is leaving, its host is uncertain (the write may not have
+	// taken), so every press is acted on: a repeat of the target resends.
+	if !s.keyboardLeaving(kb, s.clk.Now()) && k == kb.host {
 		// setHost to its own slot would make the keyboard reconnect.
 		s.log.Debug("own slot pressed; ignoring", "path", kb.path, "slot", k+1)
 		return
@@ -107,7 +111,7 @@ func (s *Switcher) startSwitch(kbs []*device, kbSlot, mouseSlot int) (sent int) 
 			s.log.Warn("keyboard setHost failed", "path", kb.path, "slot", kbSlot+1, "err", err)
 			continue
 		}
-		kb.host = kbSlot // it is leaving for kbSlot
+		kb.leavingTo = kbSlot
 		kb.leavingSince = now
 		sent++
 	}
@@ -115,9 +119,10 @@ func (s *Switcher) startSwitch(kbs []*device, kbSlot, mouseSlot int) (sent int) 
 }
 
 // keyboardLeaving reports whether kb is within leavingGrace of a host change,
-// so its divert check is skipped. When the grace ends with kb still here
-// (the write did not make it leave), the flag is cleared and its host
-// forgotten so the normal check re-reads it.
+// so its divert check is skipped and the own-slot no-op does not apply.
+// When the grace ends with kb still here (the write did not make it leave),
+// the flag is cleared and its host forgotten so the normal check re-reads
+// it.
 func (s *Switcher) keyboardLeaving(kb *device, now time.Time) bool {
 	if kb.leavingSince.IsZero() {
 		return false
@@ -126,6 +131,7 @@ func (s *Switcher) keyboardLeaving(kb *device, now time.Time) bool {
 		return true
 	}
 	kb.leavingSince = time.Time{}
+	kb.leavingTo = -1
 	kb.host = -1
 	return false
 }
@@ -204,22 +210,31 @@ func (s *Switcher) startProbe(p *pendingSwitch, d *device) {
 }
 
 // handleSend commits a mouse setHost write. A failed write is retried by
-// the next Tick (or when the mouse is reopened). A successful write whose
-// mouse has already been dropped counts as delivered.
+// the next Tick (or when the mouse is reopened). A write that timed out was
+// cancelled but may still have reached the mouse, so it counts as sent,
+// unconfirmed: like a successful write, the mouse leaving within
+// deliveryWindow means delivered, and a mouse still here after probeAfter
+// is probed and resent if not on the target. A sent write whose mouse has
+// already been dropped counts as delivered.
 func (s *Switcher) handleSend(r sendResult) {
 	p := s.pend
 	if p == nil || p.gen != r.gen {
 		return
 	}
 	delete(p.busy, r.d)
+	timedOut := errors.Is(r.err, hid.ErrWriteTimeout)
 	switch {
-	case r.err != nil:
+	case r.err != nil && !timedOut:
 		s.log.Debug("mouse setHost failed; will retry", "path", r.d.path, "slot", p.slot+1, "err", r.err)
 	case !s.current(r.d):
 		s.delivered(p, r.d, "left during setHost")
 	default:
 		p.sent[r.d] = r.at
-		s.log.Debug("mouse setHost sent", "path", r.d.path, "slot", p.slot+1)
+		if timedOut {
+			s.log.Debug("mouse setHost timed out; treating as sent, unconfirmed", "path", r.d.path, "slot", p.slot+1)
+		} else {
+			s.log.Debug("mouse setHost sent", "path", r.d.path, "slot", p.slot+1)
+		}
 	}
 }
 

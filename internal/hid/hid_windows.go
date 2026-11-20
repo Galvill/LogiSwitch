@@ -29,8 +29,6 @@ var guidHID = windows.GUID{
 
 const hidpStatusSuccess = 0x00110000 // HIDP_STATUS_SUCCESS
 
-var errWriteTimeout = errors.New("hid: write timeout")
-
 var (
 	hidDLL                    = windows.NewLazySystemDLL("hid.dll")
 	procHidDGetAttributes     = hidDLL.NewProc("HidD_GetAttributes")
@@ -359,7 +357,7 @@ func (d *device) Write(report []byte, timeout time.Duration) error {
 		}
 		return fmt.Errorf("hid: write: %w", err)
 	case status == ioTimeout:
-		return errWriteTimeout
+		return ErrWriteTimeout
 	case int(n) != len(d.wbuf):
 		return fmt.Errorf("hid: short write: %d of %d bytes", n, len(d.wbuf))
 	}

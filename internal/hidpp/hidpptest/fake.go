@@ -34,6 +34,10 @@ type Fake struct {
 	connected    bool
 	closed       bool
 	delay        time.Duration
+	// timeouts: a Write whose delay exceeds its timeout returns at the
+	// timeout with hid.ErrWriteTimeout, yet still takes effect (cancelled
+	// but delivered).
+	timeouts bool
 
 	out    chan []byte
 	closeC chan struct{}
@@ -97,6 +101,15 @@ func (f *Fake) Reconnect() {
 func (f *Fake) SetWriteDelay(d time.Duration) {
 	f.mu.Lock()
 	f.delay = d
+	f.mu.Unlock()
+}
+
+// SetWriteTimeouts makes a Write whose delay exceeds its timeout return
+// hid.ErrWriteTimeout at the timeout while still applying the write, as a
+// cancelled report that the device nevertheless received.
+func (f *Fake) SetWriteTimeouts(on bool) {
+	f.mu.Lock()
+	f.timeouts = on
 	f.mu.Unlock()
 }
 
@@ -173,8 +186,12 @@ func (f *Fake) Read(buf []byte, timeout time.Duration) (int, error) {
 // Write implements hid.Device.
 func (f *Fake) Write(report []byte, timeout time.Duration) error {
 	f.mu.Lock()
-	d := f.delay
+	d, honour := f.delay, f.timeouts
 	f.mu.Unlock()
+	timedOut := false
+	if honour && timeout >= 0 && d > timeout {
+		d, timedOut = timeout, true
+	}
 	if d > 0 {
 		select {
 		case <-time.After(d):
@@ -194,6 +211,9 @@ func (f *Fake) Write(report []byte, timeout time.Duration) error {
 		return errors.New("hidpptest: malformed report")
 	}
 	f.handle(m)
+	if timedOut {
+		return hid.ErrWriteTimeout
+	}
 	return nil
 }
 

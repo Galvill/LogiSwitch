@@ -507,8 +507,8 @@ func TestLeavingKeyboardThatStaysResumesUpkeep(t *testing.T) {
 	r.stayKB()
 	r.inject(0xD2)
 	kd := r.s.devs[kbPath]
-	if kd.host != 1 {
-		t.Fatalf("host = %d, want 1 after switch", kd.host)
+	if kd.host != 0 || kd.leavingTo != 1 {
+		t.Fatalf("host = %d leavingTo = %d, want 0 and 1 after switch", kd.host, kd.leavingTo)
 	}
 	before := r.o.callCount(kbPath, kbRP, 2)
 	r.clk.Advance(6 * time.Second)

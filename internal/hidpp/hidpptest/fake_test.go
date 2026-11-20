@@ -164,3 +164,21 @@ func TestFakeDisconnectedAndDelayAndClose(t *testing.T) {
 		t.Errorf("write after close = %v", err)
 	}
 }
+
+func TestFakeWriteTimeoutStillDelivers(t *testing.T) {
+	f := NewMouse(0)
+	c := newConn(t, f)
+	f.SetWriteDelay(time.Second)
+	f.SetWriteTimeouts(true)
+	start := time.Now()
+	err := c.SetHost(10, 2, 50*time.Millisecond)
+	if !errors.Is(err, hid.ErrWriteTimeout) {
+		t.Fatalf("SetHost err = %v, want hid.ErrWriteTimeout", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("write returned after %v, want at the 50ms timeout", d)
+	}
+	if got := f.SetHostCalls(); len(got) != 1 || got[0] != 2 {
+		t.Errorf("SetHostCalls = %v, want [2] (cancelled but delivered)", got)
+	}
+}

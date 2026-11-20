@@ -15,7 +15,6 @@ package switcher
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -37,6 +36,11 @@ const (
 	// flagTempDivertable is the REPROG_CONTROLS_V4 control flag for
 	// temporary diversion.
 	flagTempDivertable = 0x20
+	// divertRecheck is how often an open, diverted keyboard is asked over
+	// BLE whether it is still diverted. A reconnect is normally caught
+	// sooner, by its path vanishing or its handle failing; this catches one
+	// that kept the handle.
+	divertRecheck = 5 * time.Second
 )
 
 // Clock supplies the current time; tests inject a fake.
@@ -71,12 +75,21 @@ type class struct {
 type device struct {
 	path, product string
 	class
-	conn     *hidpp.Conn
-	host     int  // current host, 0-based; -1 unknown
+	conn *hidpp.Conn
+	// host is the current host, 0-based; -1 unknown. For a leaving keyboard
+	// it stays the host it is leaving (see leavingTo).
+	host     int
 	diverted bool // keyboard: D1-D3 diverted as of the last check
+	// divertedBefore: keyboard: D1 was already diverted when this handle
+	// first checked it (another program, or an instance that died, holds
+	// the diversion).
+	divertedBefore bool
+	checkedAt      time.Time // keyboard: last successful divert check
 	// leavingSince is when we changed the keyboard's host (zero if not): it
-	// is on its way out, so divert upkeep pauses for leavingGrace.
+	// is on its way out to leavingTo (0-based), so divert upkeep pauses for
+	// leavingGrace.
 	leavingSince time.Time
+	leavingTo    int
 }
 
 type event struct {
@@ -104,6 +117,10 @@ type Switcher struct {
 	opening map[string]bool    // paths with an open worker in flight
 	pend    *pendingSwitch     // mouse switch not yet delivered
 	gen     int                // pendingSwitch generation counter
+	// seen records, per role, whether one was registered when presence was
+	// last logged; enumerated is set once the first Tick has enumerated.
+	seen       map[role]bool
+	enumerated bool
 
 	events   chan event   // notifications from reader goroutines
 	gone     chan *device // reader goroutines report their conn closed
@@ -127,6 +144,7 @@ func New(o hid.Opener, cfg config.Config, clk Clock, log *slog.Logger) *Switcher
 		retries: map[string]retry{},
 		present: map[string]bool{},
 		opening: map[string]bool{},
+		seen:    map[role]bool{},
 		events:  make(chan event, 64),
 		gone:    make(chan *device, 16),
 		results: make(chan any, 16),
@@ -166,11 +184,13 @@ func (s *Switcher) Tick() {
 		return
 	}
 	s.drain()
+	s.logPresence()
 	infos, err := s.opener.Enumerate(logitechVID)
 	if err != nil {
 		s.log.Error("enumerate failed", "err", err)
 		return
 	}
+	s.enumerated = true
 	present := map[string]hid.Info{}
 	var paths []string
 	for _, in := range infos {
@@ -194,8 +214,8 @@ func (s *Switcher) Tick() {
 	now := s.clk.Now()
 	for _, p := range paths {
 		if d := s.devs[p]; d != nil {
-			if d.role == roleKeyboard && !s.keyboardLeaving(d, now) {
-				took, err := ensureDiverted(d)
+			if d.role == roleKeyboard && !s.keyboardLeaving(d, now) && divertDue(d, now) {
+				took, err := ensureDiverted(d, now)
 				if err != nil {
 					s.drop(d, fmt.Sprintf("divert check failed: %v", err))
 				} else if took {
@@ -253,13 +273,7 @@ func (s *Switcher) Release() {
 		if d.role != roleKeyboard {
 			continue
 		}
-		var errs []error
-		for _, cid := range hidpp.HostSwitchCIDs {
-			if err := d.conn.SetDiverted(d.rpIdx, cid, false); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if err := errors.Join(errs...); err != nil {
+		if err := undivert(d); err != nil {
 			// Expected when the keyboard has already gone.
 			s.log.Info("undivert failed", "path", p, "err", err)
 		} else {
@@ -273,6 +287,46 @@ func (s *Switcher) Release() {
 	s.devs = map[string]*device{}
 	s.pend = nil
 	s.wg.Wait()
+}
+
+// undivert returns D1-D3 to the keyboard firmware. It stops at the first
+// failed write: a keyboard that has gone would fail the rest too, each
+// after a full timeout.
+func undivert(d *device) error {
+	for _, cid := range hidpp.HostSwitchCIDs {
+		if err := d.conn.SetDiverted(d.rpIdx, cid, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// logPresence logs "no keyboard found" / "keyboard found" (and the same for
+// the mouse) when whether one is registered changes, and once when
+// discovery first settles. It waits while opens are in flight, so a device
+// still being classified is not reported missing.
+func (s *Switcher) logPresence() {
+	if !s.enumerated || len(s.opening) > 0 {
+		return
+	}
+	for _, r := range []role{roleKeyboard, roleMouse} {
+		have := false
+		for _, d := range s.devs {
+			if d.role == r {
+				have = true
+				break
+			}
+		}
+		if was, ok := s.seen[r]; ok && was == have {
+			continue
+		}
+		s.seen[r] = have
+		if have {
+			s.log.Info(r.String() + " found")
+		} else {
+			s.log.Info("no " + r.String() + " found")
+		}
+	}
 }
 
 func isCandidate(in hid.Info) bool {

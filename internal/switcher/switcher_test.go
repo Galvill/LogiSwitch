@@ -52,9 +52,10 @@ type entry struct {
 	dev     hid.Device
 	present bool
 	openErr error
-	mute    bool             // swallow writes so requests time out
-	swallow map[[2]byte]bool // (feature, function) writes accepted but not delivered
-	calls   map[[2]byte]int  // (feature, function) -> writes seen
+	mute    bool              // swallow writes so requests time out
+	swallow map[[2]byte]bool  // (feature, function) writes accepted but not delivered
+	failW   map[[2]byte]error // (feature, function) writes failed with this error, not delivered
+	calls   map[[2]byte]int   // (feature, function) -> writes seen
 	handles []*handle
 }
 
@@ -76,7 +77,7 @@ func hidppInfo(path, product string) hid.Info {
 func (o *fakeOpener) add(info hid.Info, dev hid.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.entries[info.Path] = &entry{info: info, dev: dev, present: true, calls: map[[2]byte]int{}, swallow: map[[2]byte]bool{}}
+	o.entries[info.Path] = &entry{info: info, dev: dev, present: true, calls: map[[2]byte]int{}, swallow: map[[2]byte]bool{}, failW: map[[2]byte]error{}}
 	o.order = append(o.order, info.Path)
 }
 
@@ -90,6 +91,9 @@ func (o *fakeOpener) setPresent(path string, p bool) { o.with(path, func(e *entr
 func (o *fakeOpener) setMute(path string, m bool)    { o.with(path, func(e *entry) { e.mute = m }) }
 func (o *fakeOpener) setSwallow(path string, feat, fn byte, on bool) {
 	o.with(path, func(e *entry) { e.swallow[[2]byte{feat, fn}] = on })
+}
+func (o *fakeOpener) setWriteErr(path string, feat, fn byte, err error) {
+	o.with(path, func(e *entry) { e.failW[[2]byte{feat, fn}] = err })
 }
 func (o *fakeOpener) setOpenErr(path string, err error) {
 	o.with(path, func(e *entry) { e.openErr = err })
@@ -195,11 +199,16 @@ func (h *handle) Write(report []byte, timeout time.Duration) error {
 	}
 	h.o.mu.Lock()
 	mute := h.e.mute
+	var failErr error
 	if m, ok := hidpp.Decode(report); ok {
 		h.e.calls[[2]byte{m.Feature, m.Function}]++
 		mute = mute || h.e.swallow[[2]byte{m.Feature, m.Function}]
+		failErr = h.e.failW[[2]byte{m.Feature, m.Function}]
 	}
 	h.o.mu.Unlock()
+	if failErr != nil {
+		return failErr
+	}
 	if mute {
 		return nil
 	}
@@ -375,6 +384,7 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 		if allDiverted(kb) {
 			t.Fatal("precondition: Reconnect should clear diversion")
 		}
+		h.clk.Advance(divertRecheck) // the handle survived: periodic re-check
 		h.tick()
 		if !allDiverted(kb) {
 			t.Fatal("not re-diverted after reconnect")
@@ -428,6 +438,7 @@ func TestTickRedivertsAfterReconnect(t *testing.T) {
 
 		h.tick()
 		kb.Disconnect() // writes now fail, path stays enumerated
+		h.clk.Advance(divertRecheck)
 		h.tick()
 		if _, ok := h.s.devs[kbPath]; ok {
 			t.Fatal("keyboard with failing I/O still registered")
@@ -621,7 +632,8 @@ func TestRunTicksAndReleases(t *testing.T) {
 	go func() { h.s.Run(ctx); close(done) }()
 
 	waitFor(t, "divert", func() bool { return allDiverted(kb) })
-	kb.Reconnect() // diversion lost; Run's next Tick restores it
+	kb.Reconnect() // diversion lost; Run's next re-check restores it
+	h.clk.Advance(divertRecheck)
 	waitFor(t, "re-divert", func() bool { return allDiverted(kb) })
 	cancel()
 	select {

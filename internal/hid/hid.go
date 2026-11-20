@@ -37,4 +37,7 @@ var (
 	ErrUnsupported = errors.New("hid: unsupported on this platform")
 	// ErrClosed is returned for operations on a closed device.
 	ErrClosed = errors.New("hid: device closed")
+	// ErrWriteTimeout is returned when a write did not complete in time. The
+	// write was cancelled, but the report may still have been delivered.
+	ErrWriteTimeout = errors.New("hid: write timeout")
 )

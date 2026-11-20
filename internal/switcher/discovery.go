@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"time"
 
 	"logiswitch/internal/hid"
 	"logiswitch/internal/hidpp"
@@ -49,7 +50,7 @@ func (s *Switcher) openWorker(in hid.Info, cached class, isCached bool) openResu
 		r.what, r.err = "classify failed", err
 		return r
 	}
-	d := &device{path: in.Path, product: in.Product, class: c, conn: conn, host: -1}
+	d := &device{path: in.Path, product: in.Product, class: c, conn: conn, host: -1, leavingTo: -1}
 	switch d.role {
 	case roleMouse:
 		if _, cur, err := conn.HostInfo(c.chIdx); err == nil {
@@ -58,7 +59,7 @@ func (s *Switcher) openWorker(in hid.Info, cached class, isCached bool) openResu
 			s.log.Debug("mouse host unknown", "path", in.Path, "err", err)
 		}
 	case roleKeyboard:
-		took, err := ensureDiverted(d)
+		took, err := ensureDiverted(d, s.clk.Now())
 		if err != nil {
 			conn.Close()
 			r.what, r.err = "divert failed", err
@@ -199,15 +200,26 @@ func hasHostKeys(ctrls []hidpp.Control) bool {
 	return true
 }
 
+// divertDue reports whether an open keyboard's diversion should be checked
+// now: it is not known to be diverted, its host is unknown, or the last
+// check is divertRecheck old.
+func divertDue(kb *device, now time.Time) bool {
+	return !kb.diverted || kb.host < 0 || now.Sub(kb.checkedAt) >= divertRecheck
+}
+
 // ensureDiverted checks D1 and, if it is not diverted, diverts D1-D3 and
 // caches the keyboard's current host. The host is also read when it is not
 // yet known (a fresh handle on a keyboard that kept its diversion). took
-// reports that diversion had to be (re)applied. It touches only kb, so an
-// open worker may call it before kb is committed.
-func ensureDiverted(kb *device) (took bool, err error) {
+// reports that diversion had to be (re)applied. The first check on a handle
+// records the state found in divertedBefore. It touches only kb, so an open
+// worker may call it before kb is committed.
+func ensureDiverted(kb *device, now time.Time) (took bool, err error) {
 	on, err := kb.conn.Diverted(kb.rpIdx, hidpp.HostSwitchCIDs[0])
 	if err != nil {
 		return false, err
+	}
+	if kb.checkedAt.IsZero() {
+		kb.divertedBefore = on
 	}
 	kb.diverted = on
 	if !on {
@@ -219,6 +231,7 @@ func ensureDiverted(kb *device) (took bool, err error) {
 		kb.diverted = true
 	}
 	if on && kb.host >= 0 {
+		kb.checkedAt = now
 		return false, nil
 	}
 	_, cur, err := kb.conn.HostInfo(kb.chIdx)
@@ -226,6 +239,7 @@ func ensureDiverted(kb *device) (took bool, err error) {
 		return false, err
 	}
 	kb.host = cur
+	kb.checkedAt = now
 	return !on, nil
 }
 
